@@ -5,14 +5,17 @@ bl_info = {
         "Import .prim models and .borg skeletons with skin weights and shape keys; "
         "reshape meshes and export back to game-valid .prim (+meta). Load and edit "
         "materials (.MATI/.MATB), swap or repoint textures, and one-click build real "
-        "Blender render materials from the game's skin shader (basecolor, SRM, normal, "
-        "translucency, with parameters wired in). Native pure-Python texture codec: "
+        "Blender render materials from the game's shaders. The render-material "
+        "engine detects the material family (skin, eye, hair, fabric, generic) and "
+        "builds a family-aware Principled graph (basecolor, SRM, normal + detail "
+        "normal, translucency, AO, emission, alpha) with parameters wired in. "
+        "Native pure-Python texture codec: "
         "decode and encode .TEXT/.TEXD (BC1/BC3/BC4/BC5/BC7) to and from PNG/TGA, "
         "auto-detect formats, generate a missing .TEXT/.TEXD from an image, and package "
         "everything with correct DISTINCT TEXT/TEXD hashes and metas. Plus LOD tools and "
         "material-name resolution from IOI paths."),
     "author": "Glacier modding community",
-    "version": (1, 14, 0),
+    "version": (1, 35, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > 007 Mesh Tools  •  File > Import/Export > Glacier 2 007",
     "category": "Import-Export",
@@ -83,6 +86,12 @@ class Reader:
     def u8vec(self, n):
         return list(self.f.read(n))
 
+    def align16(self):
+        pos = self.f.tell()
+        pad = (16 - (pos % 16)) % 16
+        if pad:
+            self.f.seek(pos + pad)
+
     def fixed_str(self, n):
         raw = self.f.read(n)
         z = raw.find(b"\x00")
@@ -124,7 +133,7 @@ class VertexBuffer:
     def __init__(self):
         self.vertices = []
 
-    def read(self, br, count, mesh):
+    def read(self, br, count, mesh, weighted=False):
         self.vertices = [Vertex() for _ in range(count)]
 
         # Positions: int16x4, 8 B/vert. XYZ quantized; W is the 4th bone index
@@ -139,10 +148,18 @@ class VertexBuffer:
 
         sub = mesh.sub_type
         tsb = mesh.tex_scale_bias
+        # uvChannelCount from PRIM_OBJECT_SUBTYPE: 3/4/5 -> 2/3/4 UV sets.
+        uvc = {3: 2, 4: 3, 5: 4}.get(sub, 1)
 
-        if sub == 2:  # WEIGHTED: 8B sub-A | 16B NTB+UV | 4B colour (stream-major)
-            for v in self.vertices:
-                br.u8vec(8)  # sub-A (unidentified) - skipped for import
+        # 007FL vertex streams are TIGHTLY PACKED - verified on real files: each
+        # object is exactly (8 pos + [8 skin] + (12 NTB + 4*uvc UV) + [4 colour])
+        # bytes/vertex with NO inter-stream 16-byte padding. The old align16()
+        # calls skipped 8 real bytes whenever a stream had an odd vertex count,
+        # which shifted and scrambled the UVs on exactly those objects.
+
+        def read_ntb_uv(uv_n):
+            # Normal(4) + Tangent(4) + Bitangent(4) + uv_n x UV(4). Channel 0
+            # becomes the Blender UVMap; extra channels are stepped over.
             for v in self.vertices:
                 v.normal = decode_unit_vec4ub(br.u8vec(4))
                 br.u8vec(4)  # tangent
@@ -150,16 +167,69 @@ class VertexBuffer:
                 u = br.i16(); vv = br.i16()
                 v.uv[0][0] = (u / 32767.0) * tsb[0] + tsb[2]
                 v.uv[0][1] = (vv / 32767.0) * tsb[1] + tsb[3]
+                for _ in range(uv_n - 1):
+                    br.i16(); br.i16()
+
+        # WEIGHTED is decided by the header flag, NOT the subtype - a weighted
+        # mesh can still be STANDARD_UV_2/3/4.
+        if weighted:
             for v in self.vertices:
-                v.color = br.u8vec(4)
-        elif sub in (0, 1):  # LINKED/STANDARD: 16 B/vert interleaved NTB+UV
-            for v in self.vertices:
-                v.normal = decode_unit_vec4ub(br.u8vec(4))
-                br.u8vec(4)
-                br.u8vec(4)
-                u = br.i16(); vv = br.i16()
-                v.uv[0][0] = (u / 32767.0) * tsb[0] + tsb[2]
-                v.uv[0][1] = (vv / 32767.0) * tsb[1] + tsb[3]
+                br.u8vec(8)  # skinning-adjacency block (weights come from skin_off)
+
+            # The NTB+UV record is 12 + 4*uvc bytes, but the UV channel sits in
+            # one of two slots depending on the vertex declaration:
+            #   face/body : Normal Tangent Bitangent UV  -> UV at +12 (+colour after)
+            #   eyelash/hair: Normal Tangent UV Bitangent -> UV at +8 (no colour)
+            # Both are subtype-2 36 B/vert, so the only reliable discriminator is
+            # which slot yields a coherent UV map. Decode both and score each
+            # against the index buffer (a real UV map has short triangle edges).
+            rec = 12 + 4 * uvc
+            block = bytes(br.u8vec(rec * count))
+
+            def _decode_uv(off):
+                out = []
+                for k in range(count):
+                    b = k * rec + off
+                    u = struct.unpack_from("<h", block, b)[0]
+                    w = struct.unpack_from("<h", block, b + 2)[0]
+                    out.append(((u / 32767.0) * tsb[0] + tsb[2],
+                                (w / 32767.0) * tsb[1] + tsb[3]))
+                return out
+
+            def _score(uvs):
+                idx = getattr(mesh, "indices", None) or []
+                if len(idx) < 3:
+                    return 0.0
+                step = max(3, ((len(idx) // 3) // 2000) * 3 or 3)
+                tot = 0.0; n = 0
+                for t in range(0, len(idx) - 2, step):
+                    a = idx[t]; b = idx[t + 1]
+                    if a < count and b < count:
+                        ua = uvs[a]; ub = uvs[b]
+                        dx = ua[0] - ub[0]; dy = ua[1] - ub[1]
+                        tot += (dx * dx + dy * dy) ** 0.5; n += 1
+                return tot / n if n else 0.0
+
+            uv_std = _decode_uv(12)
+            uv_alt = _decode_uv(8)
+            # default to the standard +12 slot; only switch to +8 when it is
+            # CLEARLY cleaner, so coarse low-poly LODs don't flip on noise.
+            use_alt = _score(uv_alt) < _score(uv_std) * 0.6
+            chosen = uv_alt if use_alt else uv_std
+            for v, uv in zip(self.vertices, chosen):
+                v.uv[0][0] = uv[0]; v.uv[0][1] = uv[1]
+            for k, v in enumerate(self.vertices):
+                v.normal = decode_unit_vec4ub(block[k * rec:k * rec + 4])
+
+            # Records that keep the UV in the last slot are followed by a 4 B/vert
+            # vertex-colour stream; the +8 variant uses that slot for bitangent.
+            if not use_alt:
+                for v in self.vertices:
+                    v.color = br.u8vec(4)
+        elif sub in (0, 1, 2, 3, 4, 5):
+            # Unweighted STANDARD / LINKED / STANDARD_UV_2..4: NTB + UVs packed
+            # straight after positions, no skinning block and no colour stream.
+            read_ntb_uv(uvc)
         else:
             br.u8vec(16 * count)  # unverified subtype, skip
 
@@ -177,6 +247,8 @@ class PrimMesh:
         self.num_indices = 0
         self.indices = []
         self.vertexBuffer = VertexBuffer()
+        self.aux_offset = 0
+        self.cloth_data_offset = 0        # field +0x18; nonzero = cloth/hair
 
     def read(self, br, weighted):
         # PRIM_OBJECT (44 bytes)
@@ -196,8 +268,8 @@ class PrimMesh:
         self.num_indices = br.u32()
         br.u32()                                   # unknown_0C
         ibo = br.u32()
-        br.u32()                                   # aux/collision (unused on import)
-        br.u32()                                   # unknown_18
+        self.aux_offset = br.u32()                 # aux/collision stream offset
+        self.cloth_data_offset = br.u32()          # cloth sim blob offset (0 = none)
 
         self.pos_scale = br.fvec(4)
         self.pos_bias = br.fvec(4)
@@ -212,7 +284,7 @@ class PrimMesh:
 
         if self.num_vertices > 0:
             br.seek(vbo)
-            self.vertexBuffer.read(br, self.num_vertices, self)
+            self.vertexBuffer.read(br, self.num_vertices, self, weighted)
 
         br.seek(resume)
 
@@ -658,6 +730,15 @@ def build_mesh(prim, name, index):
     except Exception as e:
         print("[007 import] custom normals skipped for %s: %s" % (name, e))
 
+    # The imported custom split normals already describe the shading, so any
+    # "sharp" edge flags are redundant and just litter the mesh with hard edges
+    # that look wrong in the viewport. Clear them for clean smooth shading.
+    try:
+        for e in mesh.edges:
+            e.use_edge_sharp = False
+    except Exception:
+        pass
+
     return mesh
 
 
@@ -779,10 +860,21 @@ class IMPORT_SCENE_OT_glacier2_prim(Operator, ImportHelper):
         default=False,
     )
 
+    auto_materials: BoolProperty(
+        name="Auto-Apply Materials & Textures",
+        description="After import, automatically find the model's .MATI materials and "
+                    ".TEXT/.TEXD textures sitting in the same folder as the .prim, "
+                    "decode them, build the render materials and assign them to the "
+                    "imported meshes - so the model comes in already textured. Turn off "
+                    "to import the bare mesh and set materials up yourself",
+        default=True,
+    )
+
     def draw(self, context):
         layout = self.layout
         layout.label(text="Import options:")
         layout.prop(self, "import_shapekeys")
+        layout.prop(self, "auto_materials")
         weighted = False
         if self.filepath and os.path.exists(self.filepath) and self.filepath.lower().endswith(".prim"):
             try:
@@ -866,9 +958,49 @@ class IMPORT_SCENE_OT_glacier2_prim(Operator, ImportHelper):
                 obj.parent = arma
 
         context.view_layer.update()
-        self.report({"INFO"}, "Imported %d object(s)%s" % (
-            prim.num_objects(), " + rig" if arma is not None else ""))
+
+        applied = ""
+        if self.auto_materials:
+            applied = self._auto_apply(context, src, collection)
+
+        self.report({"INFO"}, "Imported %d object(s)%s%s" % (
+            prim.num_objects(), " + rig" if arma is not None else "", applied))
         return {"FINISHED"}
+
+    def _auto_apply(self, context, src, collection):
+        """Find the .MATI / .TEXT / .TEXD next to the imported .prim, load them,
+        build the render materials and assign them to the imported meshes."""
+        sc = context.scene
+        folder = os.path.dirname(src)
+        if not folder or not os.path.isdir(folder):
+            return ""
+        sc.glacier_scan_folder = folder
+        if not (sc.glacier_tex_folder or "").strip():
+            sc.glacier_tex_folder = folder
+        sc.glacier_scan_model_only = True
+        # select the freshly imported meshes (helps any selection-based context)
+        try:
+            for o in context.selected_objects:
+                o.select_set(False)
+            for o in collection.objects:
+                if o.type == "MESH":
+                    o.select_set(True)
+        except Exception:
+            pass
+        try:
+            res = bpy.ops.glacier.scan_folder("EXEC_DEFAULT")
+            if "FINISHED" not in res:
+                return "  (no materials found next to the .prim)"
+            bpy.ops.glacier.build_materials("EXEC_DEFAULT", apply_to="MODEL")
+            try:
+                bpy.ops.glacier.set_shading("EXEC_DEFAULT")
+            except Exception:
+                pass
+            return "  + materials & textures applied"
+        except Exception as e:
+            self.report({"WARNING"}, "Auto-apply skipped (%s). Load materials from the "
+                        "007 Mesh Tools > Materials section." % e)
+            return ""
 
 
 # =============================================================================
@@ -947,11 +1079,15 @@ def patch_object(data, meta, coords, normals):
     struct.pack_into("<fff", data, meta["pos_bias_off"], bias[0], bias[1], bias[2])
 
     if normals is not None:
+        def _a16(x): return (x + 15) & ~15
         sub = meta["sub_type"]
-        if sub == 2:            # weighted: positions(8N) + subA(8N) then NTB+UV(16)
-            nrm_base, stride = vbo + 16 * n, 16
-        elif sub in (0, 1):     # linked/standard: positions(8N) then NTB+UV(16)
-            nrm_base, stride = vbo + 8 * n, 16
+        if sub == 2:            # weighted: positions(8N) [align] subA(8N) [align] NTB+UV(16)
+            suba_start = _a16(vbo + n * 8)
+            nrm_base = _a16(suba_start + n * 8)
+            stride = 16
+        elif sub in (0, 1):     # linked/standard: positions(8N) [align] NTB+UV(16)
+            nrm_base = _a16(vbo + n * 8)
+            stride = 16
         else:
             return
         for i in range(n):
@@ -978,6 +1114,8 @@ def derive_meta_path(prim_path):
 
 
 def parse_meta(data):
+    if len(data) < 40:
+        return None
     m = {
         "resource_id": struct.unpack_from("<Q", data, 0)[0],
         "data_offset": struct.unpack_from("<Q", data, 8)[0],
@@ -990,14 +1128,17 @@ def parse_meta(data):
         "dummy": 0,
         "refs": [],
     }
-    if m["refs_table_size"] > 0:
+    if m["refs_table_size"] > 0 and len(data) >= 44:
         cnt = struct.unpack_from("<H", data, 40)[0]
         m["dummy"] = struct.unpack_from("<H", data, 42)[0]
-        flags = data[44:44 + cnt]
         hbase = 44 + cnt
+        # bounds: need hbase + cnt*8 <= len(data)
+        if hbase + cnt * 8 > len(data):
+            cnt = max(0, (len(data) - hbase) // 8)
+        flags = data[44:44 + cnt]
         for i in range(cnt):
             h = struct.unpack_from("<Q", data, hbase + i * 8)[0]
-            m["refs"].append((h, flags[i]))
+            m["refs"].append((h, flags[i] if i < len(flags) else 0))
     return m
 
 
@@ -1044,6 +1185,213 @@ def build_meta_json(m, extra_refs):
             {"hash": "%016X" % h, "flag": "%02X" % f} for (h, f) in refs
         ],
     }
+
+
+# =============================================================================
+# RPKG v2 archive reader  (007 First Light raw chunk reader)
+# -----------------------------------------------------------------------------
+# Reads the game's packed .rpkg / chunkNN.rpkg directly so TEXT/TEXD (and any
+# other resource) can be mass-extracted without RPKG-Tool. Format from the 010
+# template (RPKG.txt): header -> ResourceDataTable -> ResourceMetadataTable ->
+# resource data. Magic "GKPR" (RPKG) or "2KPR" (RPK2). Resources may be XOR
+# scrambled and/or LZ4 compressed; we descramble + decompress on extract.
+#
+# The XOR scramble key. First Light (verified empirically on chunk data) uses
+# the long-standing Glacier resource scramble. We auto-detect on extract by
+# validating the result, and the key is user-overridable in the UI, so a wrong
+# guess here is recoverable without a code change.
+# =============================================================================
+RPKG_XOR_KEY = bytes((0xDC, 0x45, 0xA6, 0x9C, 0xD3, 0x72, 0x4C, 0xAB))
+
+
+def rpkg_xor(data, key=RPKG_XOR_KEY):
+    """In-place style XOR descramble/scramble (symmetric). Returns bytes."""
+    if not key:
+        return bytes(data)
+    out = bytearray(data)
+    klen = len(key)
+    for i in range(len(out)):
+        out[i] ^= key[i % klen]
+    return bytes(out)
+
+
+def _rpkg_ext_from_archive(raw4):
+    """Resource extension is stored reversed in the archive (e.g. TXET->TEXT)."""
+    return raw4[::-1].decode("ascii", "replace").rstrip("\x00")
+
+
+class RpkgArchive:
+    """Parsed index of an RPKG v2 archive. Does NOT load resource data; extract
+    seeks the file per-resource so multi-GB chunks stay memory-light."""
+
+    def __init__(self, path):
+        self.path = path
+        self.is_rpk2 = False
+        self.entries = []          # list of dicts (see _parse)
+        self.by_hash = {}          # "%016X" -> entry
+        self._parse()
+
+    def _parse(self):
+        with open(os.fsencode(self.path), "rb") as f:
+            head = f.read(64)
+            magic = head[0:4]
+            if magic not in (b"GKPR", b"2KPR"):
+                raise ValueError("Not an RPKG archive (magic %r). Point at a "
+                                 ".rpkg or chunk file." % magic)
+            off = 4
+            patch_id = 0
+            if magic == b"2KPR":
+                self.is_rpk2 = True
+                # uint Unknown, ubyte chunkID, ubyte chunkType,
+                # ubyte chunkPatchID, char langCode[2]
+                off += 4
+                off += 1                                   # chunkID
+                off += 1                                   # chunkType
+                patch_id = head[off]; off += 1             # chunkPatchID
+                off += 2                                   # languageCode[2]
+            res_count = struct.unpack_from("<I", head, off)[0]; off += 4
+            hash_table_size = struct.unpack_from("<I", head, off)[0]; off += 4
+            meta_table_size = struct.unpack_from("<I", head, off)[0]; off += 4
+            if patch_id > 0:
+                del_count = struct.unpack_from("<I", head, off)[0]; off += 4
+                off += 8 * del_count                       # deletion hashes
+
+            data_table_off = off
+            meta_table_off = data_table_off + hash_table_size
+
+            f.seek(0, 2)
+            file_size = f.tell()
+            if meta_table_off + meta_table_size > file_size:
+                raise ValueError(
+                    "This file only contains the chunk's hash table, not the "
+                    "resource data (it's %d bytes but the index needs %d). Point "
+                    "at the full chunkNN.rpkg in the game's Runtime folder, not a "
+                    "stripped .meta hash list." % (file_size,
+                                                   meta_table_off + meta_table_size))
+
+            f.seek(data_table_off)
+            data_tbl = f.read(hash_table_size)
+            f.seek(meta_table_off)
+            meta_tbl = f.read(meta_table_size)
+
+        # ResourceDataEntry: u64 id, u64 offset, u32 rawSize  (20 bytes)
+        data = []
+        for i in range(res_count):
+            rid, roff, rsize = struct.unpack_from("<QQI", data_tbl, i * 20)
+            data.append((rid, roff, rsize))
+
+        # ResourceMetadataEntry (variable). First Light has NO states table.
+        # The reference layout in-archive uses the same GROUPED format as
+        # standalone .meta files: [count, dummy, flags[N], hashes[N]].
+        mo = 0
+        mtbl_len = len(meta_tbl)
+        entries = []
+        for i in range(res_count):
+            if mo + 20 > mtbl_len:
+                break                                      # truncated table
+            rid, roff, rsize = data[i]
+            ext = _rpkg_ext_from_archive(meta_tbl[mo:mo + 4]); mo += 4
+            refs_size = struct.unpack_from("<I", meta_tbl, mo)[0]; mo += 4
+            size_unc = struct.unpack_from("<I", meta_tbl, mo)[0]; mo += 4
+            size_mem = struct.unpack_from("<I", meta_tbl, mo)[0]; mo += 4
+            size_vid = struct.unpack_from("<I", meta_tbl, mo)[0]; mo += 4
+            refs = []
+            dummy = 0
+            if refs_size > 0 and mo + 4 <= mtbl_len:
+                ref_count = struct.unpack_from("<H", meta_tbl, mo)[0]; mo += 2
+                dummy = struct.unpack_from("<H", meta_tbl, mo)[0]; mo += 2
+                # grouped layout: flags[N] then hashes[N]
+                fbase = mo
+                hbase = fbase + ref_count
+                if hbase + ref_count * 8 <= mtbl_len:
+                    for k in range(ref_count):
+                        flag = meta_tbl[fbase + k]
+                        rh = struct.unpack_from("<Q", meta_tbl, hbase + k * 8)[0]
+                        refs.append((rh, flag))
+                mo = hbase + ref_count * 8
+            actual = rsize & 0x3FFFFFFF
+            entry = {
+                "hash": "%016X" % rid,
+                "rid": rid,
+                "ext": ext,
+                "offset": roff,
+                "actual_size": actual,
+                "size_raw": rsize,
+                "compressed": bool(rsize & 0x40000000),
+                "scrambled": bool(rsize & 0x80000000),
+                "size_uncompressed": size_unc,
+                "size_memory": size_mem,
+                "size_video": size_vid,
+                "refs": refs,
+                "dummy": dummy,
+            }
+            entries.append(entry)
+            self.by_hash[entry["hash"]] = entry
+        self.entries = entries
+
+    def filter(self, exts=None, search=""):
+        """Return entries whose ext is in `exts` (set/None=all) and whose hash
+        contains `search` (case-insensitive)."""
+        s = (search or "").upper().strip()
+        out = []
+        for e in self.entries:
+            if exts is not None and e["ext"] not in exts:
+                continue
+            if s and s not in e["hash"]:
+                continue
+            out.append(e)
+        return out
+
+    def read_raw(self, entry):
+        """Read a resource's stored bytes (still scrambled/compressed)."""
+        with open(os.fsencode(self.path), "rb") as f:
+            f.seek(entry["offset"])
+            return f.read(entry["actual_size"])
+
+    def extract(self, entry, key=RPKG_XOR_KEY):
+        """Return the fully decoded resource bytes (descrambled + decompressed)."""
+        raw = self.read_raw(entry)
+        if entry["scrambled"]:
+            raw = rpkg_xor(raw, key)
+        if entry["compressed"]:
+            raw = lz4_decompress(raw, entry["size_uncompressed"])
+        return raw
+
+    def standalone_meta(self, entry):
+        """Synthesise the standalone <hash>_<EXT>.meta binary for this resource,
+        so the rest of the toolkit (pairing TEXT->TEXD, decoding) just works."""
+        m = {
+            "resource_id": entry["rid"],
+            "data_offset": 0,
+            "size_raw": entry["actual_size"],
+            "ext_raw": (entry["ext"] + "\x00" * 4)[:4].encode("ascii", "replace"),
+            "refs_table_size": 0,
+            "size_uncompressed": entry["size_uncompressed"],
+            "size_memory": entry["size_memory"],
+            "size_video": entry["size_video"],
+            "dummy": entry["dummy"],
+            "refs": list(entry["refs"]),
+        }
+        return build_meta_binary(m, [])
+
+
+# module-level cache so scan + extract don't re-parse a huge chunk twice
+_RPKG_CACHE = {}
+
+
+def rpkg_open_cached(path):
+    """Return a parsed RpkgArchive, cached by (path, mtime)."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = 0
+    key = os.path.abspath(path)
+    hit = _RPKG_CACHE.get(key)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    arc = RpkgArchive(path)
+    _RPKG_CACHE[key] = (mtime, arc)
+    return arc
 
 
 def hash_from_filename(path):
@@ -1671,6 +2019,94 @@ def _interp(e0, e1, w):
     return ((64 - w) * e0 + w * e1 + 32) >> 6
 
 
+# --- BC7 subset partition tables (canonical, from the BC7 spec) --------------
+# Per-texel subset index for 2-subset and 3-subset partitioned modes.
+_BC7_P2 = (
+    (0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1),(0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1),
+    (0,1,1,1,0,1,1,1,0,1,1,1,0,1,1,1),(0,0,0,1,0,0,1,1,0,0,1,1,0,1,1,1),
+    (0,0,0,0,0,0,0,1,0,0,0,1,0,0,1,1),(0,0,1,1,0,1,1,1,0,1,1,1,1,1,1,1),
+    (0,0,0,1,0,0,1,1,0,1,1,1,1,1,1,1),(0,0,0,0,0,0,0,1,0,0,1,1,0,1,1,1),
+    (0,0,0,0,0,0,0,0,0,0,0,1,0,0,1,1),(0,0,1,1,0,1,1,1,1,1,1,1,1,1,1,1),
+    (0,0,0,0,0,0,0,1,0,1,1,1,1,1,1,1),(0,0,0,0,0,0,0,0,0,0,0,1,0,1,1,1),
+    (0,0,0,1,0,1,1,1,1,1,1,1,1,1,1,1),(0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1),
+    (0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1),(0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1),
+    (0,0,0,0,1,0,0,0,1,1,1,0,1,1,1,1),(0,1,1,1,0,0,0,1,0,0,0,0,0,0,0,0),
+    (0,0,0,0,0,0,0,0,1,0,0,0,1,1,1,0),(0,1,1,1,0,0,1,1,0,0,0,1,0,0,0,0),
+    (0,0,1,1,0,0,0,1,0,0,0,0,0,0,0,0),(0,0,0,0,1,0,0,0,1,1,0,0,1,1,1,0),
+    (0,0,0,0,0,0,0,0,1,0,0,0,1,1,0,0),(0,1,1,1,0,0,1,1,0,0,1,1,0,0,0,1),
+    (0,0,1,1,0,0,0,1,0,0,0,1,0,0,0,0),(0,0,0,0,1,0,0,0,1,0,0,0,1,1,0,0),
+    (0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0),(0,0,1,1,0,1,1,0,0,1,1,0,1,1,0,0),
+    (0,0,0,1,0,1,1,1,1,1,1,0,1,0,0,0),(0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0),
+    (0,1,1,1,0,0,0,1,1,0,0,0,1,1,1,0),(0,0,1,1,1,0,0,1,1,0,0,1,1,1,0,0),
+    (0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1),(0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1),
+    (0,1,0,1,1,0,1,0,0,1,0,1,1,0,1,0),(0,0,1,1,0,0,1,1,1,1,0,0,1,1,0,0),
+    (0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0),(0,1,0,1,0,1,0,1,1,0,1,0,1,0,1,0),
+    (0,1,1,0,1,0,0,1,0,1,1,0,1,0,0,1),(0,1,0,1,1,0,1,0,1,0,1,0,0,1,0,1),
+    (0,1,1,1,0,0,1,1,1,1,0,0,1,1,1,0),(0,0,0,1,0,0,1,1,1,1,0,0,1,0,0,0),
+    (0,0,1,1,0,0,1,0,0,1,0,0,1,1,0,0),(0,0,1,1,1,0,1,1,1,1,0,1,1,1,0,0),
+    (0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,0),(0,0,1,1,1,1,0,0,1,1,0,0,0,0,1,1),
+    (0,1,1,0,0,1,1,0,1,0,0,1,1,0,0,1),(0,0,0,0,0,1,1,0,0,1,1,0,0,0,0,0),
+    (0,1,0,0,1,1,1,0,0,1,0,0,0,0,0,0),(0,0,1,0,0,1,1,1,0,0,1,0,0,0,0,0),
+    (0,0,0,0,0,0,1,0,0,1,1,1,0,0,1,0),(0,0,0,0,0,1,0,0,1,1,1,0,0,1,0,0),
+    (0,1,1,0,1,1,0,0,1,0,0,1,0,0,1,1),(0,0,1,1,0,1,1,0,1,1,0,0,1,0,0,1),
+    (0,1,1,0,0,0,1,1,1,0,0,1,1,1,0,0),(0,0,1,1,1,0,0,1,1,1,0,0,0,1,1,0),
+    (0,1,1,0,1,1,0,0,1,1,0,0,1,0,0,1),(0,1,1,0,0,0,1,1,0,0,1,1,1,0,0,1),
+    (0,1,1,1,1,1,1,0,1,0,0,0,0,0,0,1),(0,0,0,1,1,0,0,0,1,1,1,0,0,1,1,1),
+    (0,0,0,0,1,1,1,1,0,0,1,1,0,0,1,1),(0,0,1,1,0,0,1,1,1,1,1,1,0,0,0,0),
+    (0,0,1,0,0,0,1,0,1,1,1,0,1,1,1,0),(0,1,0,0,0,1,0,0,0,1,1,1,0,1,1,1),
+)
+_BC7_P3 = (
+    (0,0,1,1,0,0,1,1,0,2,2,1,2,2,2,2),(0,0,0,1,0,0,1,1,2,2,1,1,2,2,2,1),
+    (0,0,0,0,2,0,0,1,2,2,1,1,2,2,1,1),(0,2,2,2,0,0,2,2,0,0,1,1,0,1,1,1),
+    (0,0,0,0,0,0,0,0,1,1,2,2,1,1,2,2),(0,0,1,1,0,0,1,1,0,0,2,2,0,0,2,2),
+    (0,0,2,2,0,0,2,2,1,1,1,1,1,1,1,1),(0,0,1,1,0,0,1,1,2,2,1,1,2,2,1,1),
+    (0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2),(0,0,0,0,1,1,1,1,1,1,1,1,2,2,2,2),
+    (0,0,0,0,1,1,1,1,2,2,2,2,2,2,2,2),(0,0,1,2,0,0,1,2,0,0,1,2,0,0,1,2),
+    (0,1,1,2,0,1,1,2,0,1,1,2,0,1,1,2),(0,1,2,2,0,1,2,2,0,1,2,2,0,1,2,2),
+    (0,0,1,1,0,1,1,2,1,1,2,2,1,2,2,2),(0,0,1,1,2,0,0,1,2,2,0,0,2,2,2,0),
+    (0,0,0,1,0,0,1,1,0,1,1,2,1,1,2,2),(0,1,1,1,0,0,1,1,2,0,0,1,2,2,0,0),
+    (0,0,0,0,1,1,2,2,1,1,2,2,1,1,2,2),(0,0,2,2,0,0,2,2,0,0,2,2,1,1,1,1),
+    (0,1,1,1,0,1,1,1,0,2,2,2,0,2,2,2),(0,0,0,1,0,0,0,1,2,2,2,1,2,2,2,1),
+    (0,0,0,0,0,0,1,1,0,1,2,2,0,1,2,2),(0,0,0,0,1,1,0,0,2,2,1,0,2,2,1,0),
+    (0,1,2,2,0,1,2,2,0,0,1,1,0,0,0,0),(0,0,1,2,0,0,1,2,1,1,2,2,2,2,2,2),
+    (0,1,1,0,1,2,2,1,1,2,2,1,0,1,1,0),(0,0,0,0,0,1,1,0,1,2,2,1,1,2,2,1),
+    (0,0,2,2,1,1,0,2,1,1,0,2,0,0,2,2),(0,1,1,0,0,1,1,0,2,0,0,2,2,2,2,2),
+    (0,0,1,1,0,1,2,2,0,1,2,2,0,0,1,1),(0,0,0,0,2,0,0,0,2,2,1,1,2,2,2,1),
+    (0,0,0,0,0,0,0,2,1,1,2,2,1,2,2,2),(0,2,2,2,0,0,2,2,0,0,1,2,0,0,1,1),
+    (0,0,1,1,0,0,1,2,0,0,2,2,0,2,2,2),(0,1,2,0,0,1,2,0,0,1,2,0,0,1,2,0),
+    (0,0,0,0,1,1,1,1,2,2,2,2,0,0,0,0),(0,1,2,0,1,2,0,1,2,0,1,2,0,1,2,0),
+    (0,1,2,0,2,0,1,2,1,2,0,1,0,1,2,0),(0,0,1,1,2,2,0,0,1,1,2,2,0,0,1,1),
+    (0,0,1,1,1,1,2,2,2,2,0,0,0,0,1,1),(0,1,0,1,0,1,0,1,2,2,2,2,2,2,2,2),
+    (0,0,0,0,0,0,0,0,2,1,2,1,2,1,2,1),(0,0,2,2,1,1,2,2,0,0,2,2,1,1,2,2),
+    (0,0,2,2,0,0,1,1,0,0,2,2,0,0,1,1),(0,2,2,0,1,2,2,1,0,2,2,0,1,2,2,1),
+    (0,1,0,1,2,2,2,2,2,2,2,2,0,1,0,1),(0,0,0,0,2,1,2,1,2,1,2,1,2,1,2,1),
+    (0,1,0,1,0,1,0,1,0,1,0,1,2,2,2,2),(0,2,2,2,0,1,1,1,0,2,2,2,0,1,1,1),
+    (0,0,0,2,1,1,1,2,0,0,0,2,1,1,1,2),(0,0,0,0,2,1,1,2,2,1,1,2,2,1,1,2),
+    (0,2,2,2,0,1,1,1,0,1,1,1,0,2,2,2),(0,0,0,2,1,1,1,2,1,1,1,2,0,0,0,2),
+    (0,1,1,0,0,1,1,0,0,1,1,0,2,2,2,2),(0,0,0,0,0,0,0,0,2,1,1,2,2,1,1,2),
+    (0,1,1,0,0,1,1,0,2,2,2,2,2,2,2,2),(0,0,2,2,0,0,1,1,0,0,1,1,0,0,2,2),
+    (0,0,2,2,1,1,2,2,1,1,2,2,0,0,2,2),(0,0,0,0,0,0,0,0,0,0,0,0,2,1,1,2),
+    (0,0,0,2,0,0,0,1,0,0,0,2,0,0,0,1),(0,2,2,2,1,2,2,2,0,2,2,2,1,2,2,2),
+    (0,1,0,1,2,2,2,2,2,2,2,2,2,2,2,2),(0,1,1,1,2,0,1,1,2,2,0,1,2,2,2,0),
+)
+# fix-up (anchor) index per partition: where each subset's index drops its MSB
+_BC7_A2 = (
+    15,15,15,15,15,15,15,15,15,15,15,15,15,15,15,15,
+    15, 2, 8, 2, 2, 8, 8,15, 2, 8, 2, 2, 8, 8, 2, 2,
+    15,15, 6, 8, 2, 8,15,15, 2, 8, 2, 2, 2,15,15, 6,
+     6, 2, 6, 8,15,15, 2, 2,15,15,15,15,15, 2, 2,15)
+_BC7_A3a = (
+     3, 3,15,15, 8, 3,15,15, 8, 8, 6, 6, 6, 5, 3, 3,
+     3, 3, 8,15, 3, 3, 6,10, 5, 8, 8, 6, 8, 5,15,15,
+     8,15, 3, 5, 6,10, 8,15,15, 3,15, 5,15,15,15,15,
+     3,15, 5, 5, 5, 8, 5,10, 5,10, 8,13,15,12, 3, 3)
+_BC7_A3b = (
+    15, 8, 8, 3,15,15, 3, 8,15,15,15,15,15,15,15, 8,
+    15, 8,15, 3,15, 8,15, 8, 3,15, 6,10,15,15,10, 8,
+    15, 3,15,10,10, 8, 9,10, 6,15, 8,15, 3, 6, 6, 8,
+    15, 3,15,15,15,15,15,15,15,15,15,15, 3,15,15, 8)
+
+
 def bc7_decode(data, w, h):
     out = bytearray(w * h * 4)
     nbx = (w + 3) // 4
@@ -1731,12 +2167,29 @@ def _decode_block(blk):
             ca = _unq(a[i], ab) if ab else 255
         ep.append([cr, cg, cbv, ca])
 
-    # Single-subset modes (4/5/6) decode exactly. Partitioned modes need the
-    # partition/anchor tables; until those are verified against real files we
-    # approximate a partitioned block by the average of its endpoints.
+    # Partitioned modes (0/1/2/3/7): each texel belongs to a subset chosen by
+    # the partition table, and is interpolated between that subset's two
+    # endpoints. Each subset's anchor texel stores one fewer index bit.
     if ns > 1:
-        avg = [sum(e[c] for e in ep) // len(ep) for c in range(4)]
-        return [list(avg) for _ in range(16)]
+        if ns == 2:
+            psel = _BC7_P2[part]
+            anchors = (0, _BC7_A2[part])
+        else:
+            psel = _BC7_P3[part]
+            anchors = (0, _BC7_A3a[part], _BC7_A3b[part])
+        wt = _WEIGHTS[ib]
+        idx = [0] * 16
+        for p in range(16):
+            idx[p] = get(ib - (1 if p in anchors else 0))
+        texels = []
+        for p in range(16):
+            s = psel[p]
+            e0 = ep[2 * s]; e1 = ep[2 * s + 1]
+            w = wt[idx[p]]
+            texels.append([_interp(e0[0], e1[0], w), _interp(e0[1], e1[1], w),
+                           _interp(e0[2], e1[2], w),
+                           _interp(e0[3], e1[3], w) if ab else 255])
+        return texels
 
     wt1 = _WEIGHTS[ib]
     wt2 = _WEIGHTS[ib2] if ib2 else None
@@ -2584,6 +3037,101 @@ def _compute_tangents(positions, normals, uvs, indices):
     return tans, bitans
 
 
+# =============================================================================
+# LOD propagation: transfer LOD 0 edits to lower LODs
+# =============================================================================
+def _nearest_vertex_map(src, dst):
+    """For each vertex in *dst*, return the index of the nearest vertex in
+    *src*. Uses a spatial grid for O(N) average-case instead of brute O(N²)."""
+    if not src or not dst:
+        return [0] * len(dst)
+    xs = [p[0] for p in src]
+    ys = [p[1] for p in src]
+    zs = [p[2] for p in src]
+    ext = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs), 1e-6)
+    cell = ext / max(1, int(len(src) ** 0.33))
+    if cell < 1e-8:
+        cell = 1e-8
+    inv = 1.0 / cell
+    grid = {}
+    for i, p in enumerate(src):
+        key = (int(p[0] * inv), int(p[1] * inv), int(p[2] * inv))
+        grid.setdefault(key, []).append(i)
+    result = []
+    for p in dst:
+        cx = int(p[0] * inv); cy = int(p[1] * inv); cz = int(p[2] * inv)
+        best_d, best_i = float("inf"), 0
+        for r in range(1, 4):                      # expand search radius if needed
+            for dx in range(-r, r + 1):
+                for dy in range(-r, r + 1):
+                    for dz in range(-r, r + 1):
+                        for j in grid.get((cx + dx, cy + dy, cz + dz), []):
+                            q = src[j]
+                            d = (p[0]-q[0])**2 + (p[1]-q[1])**2 + (p[2]-q[2])**2
+                            if d < best_d:
+                                best_d = d; best_i = j
+            if best_d < float("inf"):
+                break                              # found at least one
+        result.append(best_i)
+    return result
+
+
+def _propagate_lod_edits(template_data, blender_objs):
+    """Compare each LOD 0 object's current Blender positions to its original
+    positions in the template .prim. For every lower LOD in the same material
+    group, find the nearest LOD 0 vertex and apply the same displacement.
+
+    Returns ``{prim_index: [(x,y,z), ...]}`` for every lower LOD that was
+    modified. LOD 0 objects are NOT included (the caller already has their
+    current positions from Blender)."""
+    orig = read_prim_bytes(template_data)
+    # group objects by material; within a group, sort by lod_index
+    groups = {}
+    for o in blender_objs:
+        mat = o.get("glacier_material_id", -1)
+        lod = o.get("glacier_lod_index", 0)
+        idx = int(o["glacier_prim_index"])
+        groups.setdefault(mat, []).append((lod, idx, o))
+    for g in groups.values():
+        g.sort()
+
+    propagated = {}
+    for mat, items in groups.items():
+        if len(items) < 2 or items[0][0] != 0:
+            continue                               # no LOD 0 or only one LOD
+        _, lod0_idx, lod0_obj = items[0]
+        if lod0_idx >= len(orig.header.object_table):
+            continue
+        lod0_sm = orig.header.object_table[lod0_idx]
+        lod0_orig = [(v.position[0], v.position[1], v.position[2])
+                     for v in lod0_sm.vertexBuffer.vertices]
+        lod0_cur = _mesh_vertex_coords(lod0_obj.data)
+        n0 = min(len(lod0_orig), len(lod0_cur))
+        if n0 == 0:
+            continue
+        deltas = [(lod0_cur[i][0] - lod0_orig[i][0],
+                   lod0_cur[i][1] - lod0_orig[i][1],
+                   lod0_cur[i][2] - lod0_orig[i][2]) for i in range(n0)]
+        # check if anything actually changed
+        if max(abs(d[0]) + abs(d[1]) + abs(d[2]) for d in deltas) < 1e-5:
+            continue
+
+        for lod_level, lod_idx, lod_obj in items[1:]:
+            if lod_idx >= len(orig.header.object_table):
+                continue
+            lod_sm = orig.header.object_table[lod_idx]
+            lod_orig = [(v.position[0], v.position[1], v.position[2])
+                        for v in lod_sm.vertexBuffer.vertices]
+            mapping = _nearest_vertex_map(lod0_orig[:n0], lod_orig)
+            new_pos = []
+            for k, p in enumerate(lod_orig):
+                j = mapping[k]
+                dd = deltas[j]
+                new_pos.append((p[0] + dd[0], p[1] + dd[1], p[2] + dd[2]))
+            propagated[lod_idx] = new_pos
+    return propagated
+
+
 def build_custom_prim(template, objects, weighted):
     """Rebuild a .prim with new topology. Unchanged objects keep their original
     vertex buffer + skin partition verbatim (byte-perfect, exactly like the safe
@@ -2595,6 +3143,8 @@ def build_custom_prim(template, objects, weighted):
     b += struct.pack("<Q", 0)          # header offset (patched at the end)
     b += struct.pack("<Q", 0)          # padding
     obj_offsets = []
+    g_min = [float("inf")] * 3         # grow the global bounds to fit edits
+    g_max = [float("-inf")] * 3
 
     for od in objects:
         n = len(od["positions"])
@@ -2612,11 +3162,38 @@ def build_custom_prim(template, objects, weighted):
         o_tsb = struct.unpack_from("<4f", template, orig_off + 104)
         o_cloth = struct.unpack_from("<I", template, orig_off + 120)[0]
 
-        verbatim = (not changed) and weighted and sub == 2 and n == o_nv
+        # ALWAYS derive fresh scale/bias from the ACTUAL positions + UVs -
+        # even when the vertex count is unchanged.  The user may have reshaped
+        # the mesh (moved vertices) without adding or removing geometry, and
+        # re-using the original scale/bias would CLAMP any vertex that left
+        # the original bounding box.  Unchanged objects that weren't edited
+        # will re-quantise from their own decoded floats, producing a near-
+        # exact round-trip (sub-millimetre noise).
+        if n:
+            psc, pbi, _iq = quantize_positions(od["positions"])
+            use_ps = (psc[0], psc[1], psc[2], o_ps[3])
+            use_pb = (pbi[0], pbi[1], pbi[2], o_pb[3])
+            us = [uv[0] for uv in od["uvs"]] or [0.0]
+            vs = [uv[1] for uv in od["uvs"]] or [0.0]
+            ulo, uhi = min(us), max(us)
+            vlo, vhi = min(vs), max(vs)
+            usx = ((uhi - ulo) / 2.0) or 1e-6
+            vsx = ((vhi - vlo) / 2.0) or 1e-6
+            use_tsb = (usx, vsx, (ulo + uhi) / 2.0, (vlo + vhi) / 2.0)
+        else:
+            use_ps, use_pb, use_tsb = o_ps, o_pb, o_tsb
 
-        # PRIM_OBJECT (44 B) copied verbatim; only patch bbox when topology changed
+        for p in od["positions"]:
+            for a in range(3):
+                if p[a] < g_min[a]:
+                    g_min[a] = p[a]
+                if p[a] > g_max[a]:
+                    g_max[a] = p[a]
+
+        # PRIM_OBJECT (44 B) copied verbatim; ALWAYS patch bbox from actual
+        # positions so the engine's culling box encompasses the current shape.
         po = bytearray(template[orig_off:orig_off + 44])
-        if changed:
+        if n:
             bbmin = [min(p[a] for p in od["positions"]) for a in range(3)]
             bbmax = [max(p[a] for p in od["positions"]) for a in range(3)]
             obmin = struct.unpack_from("<3f", template, orig_off + 20)
@@ -2635,9 +3212,9 @@ def build_custom_prim(template, objects, weighted):
         b += struct.pack("<I", 0)                       # ibo (patched)
         b += struct.pack("<I", 0)                       # aux/collision (dropped)
         b += struct.pack("<I", 0)                       # unknown_18
-        b += struct.pack("<4f", *o_ps)                  # ORIGINAL pos scale
-        b += struct.pack("<4f", *o_pb)                  # ORIGINAL pos bias
-        b += struct.pack("<4f", *o_tsb)                 # ORIGINAL tex scale/bias
+        b += struct.pack("<4f", *use_ps)                # pos scale (fresh if edited)
+        b += struct.pack("<4f", *use_pb)                # pos bias
+        b += struct.pack("<4f", *use_tsb)               # tex scale/bias
         b += struct.pack("<I", o_cloth)                 # preserve cloth id
         if weighted:
             b += b"\x00" * 20                           # +124 weighted trailer
@@ -2648,51 +3225,61 @@ def build_custom_prim(template, objects, weighted):
         for idx in od["indices"]:
             b += struct.pack("<H", idx & 0xFFFF)
 
-        # --- vertex buffer ---
+        # --- vertex buffer (ALWAYS re-emitted from current positions) ---
+        # Glacier aligns each vertex stream to a 16-byte boundary. An odd
+        # vertex count leaves an 8-byte gap after positions (n×8 mod 16 = 8)
+        # and similarly after sub-A. The export must mirror this or the game
+        # reads UVs/normals from the wrong offset.
         _align16(b)
         vbo = len(b)
-        ts = (o_tsb[0], o_tsb[1]); tb = (o_tsb[2], o_tsb[3])
-        if verbatim:
-            # copy the entire original vertex buffer (pos + Sub-A + NTB+UV + colour)
-            b += template[o_vbo:o_vbo + o_nv * 36]
+        ts = (use_tsb[0], use_tsb[1]); tb = (use_tsb[2], use_tsb[3])
+        for i, p in enumerate(od["positions"]):
+            wlane = int(od["joints"][i][3]) if (weighted and od["joints"]) else 0
+            b += struct.pack("<hhh", _q_i16(p[0], use_pb[0], use_ps[0]),
+                                     _q_i16(p[1], use_pb[1], use_ps[1]),
+                                     _q_i16(p[2], use_pb[2], use_ps[2]))
+            b += struct.pack("<h", wlane)
+        _align16(b)                                    # pad after positions
+        tans, bitans = _compute_tangents(od["positions"], od["normals"],
+                                         od["uvs"], od["indices"])
+        if weighted and sub == 2:
+            if n == o_nv:                            # keep original Sub-A bytes
+                # source sub-A also sits at the aligned offset in the template
+                src_suba = ((o_vbo + o_nv * 8) + 15) & ~15
+                b += template[src_suba:src_suba + n * 8]
+            else:                                    # synth Sub-A from UVs
+                for i in range(n):
+                    u = _q_i16(od["uvs"][i][0], tb[0], ts[0])
+                    v = _q_i16(od["uvs"][i][1], tb[1], ts[1])
+                    b += struct.pack("<hhhh", u, v, u, v)
+            _align16(b)                                # pad after sub-A
+            for i in range(n):
+                b += _enc_normal(od["normals"][i])
+                b += _enc_normal(tans[i])
+                b += _enc_normal(bitans[i])
+                b += struct.pack("<hh", _q_i16(od["uvs"][i][0], tb[0], ts[0]),
+                                        _q_i16(od["uvs"][i][1], tb[1], ts[1]))
+            _align16(b)                                # pad after NTB+UV
+            for i in range(n):
+                c = od["colors"][i]
+                b += bytes([c[0], c[1], c[2], c[3]])
         else:
-            for i, p in enumerate(od["positions"]):
-                wlane = int(od["joints"][i][3]) if (weighted and od["joints"]) else 0
-                b += struct.pack("<hhh", _q_i16(p[0], o_pb[0], o_ps[0]),
-                                         _q_i16(p[1], o_pb[1], o_ps[1]),
-                                         _q_i16(p[2], o_pb[2], o_ps[2]))
-                b += struct.pack("<h", wlane)
-            tans, bitans = _compute_tangents(od["positions"], od["normals"],
-                                             od["uvs"], od["indices"])
-            if weighted and sub == 2:
-                if n == o_nv:                            # keep original Sub-A bytes
-                    b += template[o_vbo + o_nv * 8:o_vbo + o_nv * 8 + n * 8]
-                else:                                    # synth Sub-A from UVs
-                    for i in range(n):
-                        u = _q_i16(od["uvs"][i][0], tb[0], ts[0])
-                        v = _q_i16(od["uvs"][i][1], tb[1], ts[1])
-                        b += struct.pack("<hhhh", u, v, u, v)
-                for i in range(n):
-                    b += _enc_normal(od["normals"][i])
-                    b += _enc_normal(tans[i])
-                    b += _enc_normal(bitans[i])
-                    b += struct.pack("<hh", _q_i16(od["uvs"][i][0], tb[0], ts[0]),
-                                            _q_i16(od["uvs"][i][1], tb[1], ts[1]))
-                for i in range(n):
-                    c = od["colors"][i]
-                    b += bytes([c[0], c[1], c[2], c[3]])
-            else:
-                for i in range(n):
-                    b += _enc_normal(od["normals"][i])
-                    b += _enc_normal(tans[i])
-                    b += _enc_normal(bitans[i])
-                    b += struct.pack("<hh", _q_i16(od["uvs"][i][0], tb[0], ts[0]),
-                                            _q_i16(od["uvs"][i][1], tb[1], ts[1]))
+            for i in range(n):
+                b += _enc_normal(od["normals"][i])
+                b += _enc_normal(tans[i])
+                b += _enc_normal(bitans[i])
+                b += struct.pack("<hh", _q_i16(od["uvs"][i][0], tb[0], ts[0]),
+                                        _q_i16(od["uvs"][i][1], tb[1], ts[1]))
 
         # --- skin partition (weighted only) ---
+        # When the vertex count matches the original, copy the existing skin
+        # partition verbatim (byte-exact BoneInfo / BoneIndices / weights) so
+        # the runtime batching stays valid. Only regenerate when the count
+        # changed and the original partition no longer fits.
         _align16(b)
         if weighted:
-            if verbatim:
+            same_count = (n == o_nv)
+            if same_count:
                 o_bi, o_binfo, _cc, _co, o_skin = struct.unpack_from("<5I", template, orig_off + 124)
                 bone_info_off = len(b)
                 tsize = struct.unpack_from("<H", template, o_binfo)[0]
@@ -2769,7 +3356,17 @@ def build_custom_prim(template, objects, weighted):
     b += template[th:th + 16]          # prims, property_flags, unknownPadding, bone_rig
     b += struct.pack("<I", len(obj_offsets))
     b += struct.pack("<I", obj_table_off)
-    b += template[th + 24:th + 48]     # preserve ORIGINAL global bounds (no culling)
+    # global bounds: original, grown to fit any edited geometry (avoids culling
+    # when the mesh now extends past the original box)
+    o_gmin = struct.unpack_from("<3f", template, th + 24)
+    o_gmax = struct.unpack_from("<3f", template, th + 36)
+    if g_min[0] <= g_max[0]:
+        gmin = [min(o_gmin[a], g_min[a]) for a in range(3)]
+        gmax = [max(o_gmax[a], g_max[a]) for a in range(3)]
+    else:
+        gmin, gmax = list(o_gmin), list(o_gmax)
+    b += struct.pack("<3f", *gmin)
+    b += struct.pack("<3f", *gmax)
 
     struct.pack_into("<Q", b, 0, header_off)
     return bytes(b)
@@ -2837,6 +3434,14 @@ class EXPORT_SCENE_OT_glacier2_prim(Operator, ExportHelper):
                     "Collision is dropped and the skin partition of EDITED objects "
                     "is a single batch (test in-game). Leave OFF for safe reshaping",
         default=False,
+    )
+    propagate_lod: BoolProperty(
+        name="Propagate LOD 0 Edits",
+        description="Automatically transfer your LOD 0 edits to every lower LOD "
+                    "in the same material group. Each lower-LOD vertex finds its "
+                    "nearest LOD 0 vertex and receives the same displacement, so "
+                    "you only need to sculpt/edit LOD 0",
+        default=True,
     )
     export_materials: BoolProperty(
         name="Export .MATI and .MATB",
@@ -2927,6 +3532,11 @@ class EXPORT_SCENE_OT_glacier2_prim(Operator, ExportHelper):
                 note = box.column(align=True)
                 note.label(text="Safe for unskinned meshes.", icon="ERROR")
                 note.label(text="Skinned parts still explode in-game.")
+            box.prop(self, "propagate_lod")
+            if self.propagate_lod:
+                note = box.column(align=True)
+                note.enabled = False
+                note.label(text="Copies your LOD 0 edits to all lower LODs")
 
         if mode == "FULL":
             box = layout.box()
@@ -3024,8 +3634,21 @@ class EXPORT_SCENE_OT_glacier2_prim(Operator, ExportHelper):
             self.report({"ERROR"}, "Could not parse original .prim: %s" % e)
             return {"CANCELLED"}
 
+        # LOD propagation: transfer LOD 0 edits to lower LODs so the user
+        # only has to sculpt the highest-detail mesh.
+        lod_overrides = {}              # prim_index -> [(x,y,z), ...]
+        lod_note = ""
+        if getattr(self, "propagate_lod", False):
+            try:
+                lod_overrides = _propagate_lod_edits(data, objs)
+                if lod_overrides:
+                    lod_note = ", propagated edits to %d lower LOD(s)" % len(lod_overrides)
+            except Exception as e:
+                self.report({"WARNING"}, "LOD propagation skipped: %s" % e)
+
         if self.custom_topology:
-            out_data, patched, note = self._rebuild_custom(data, objs, obj_metas, weighted)
+            out_data, patched, note = self._rebuild_custom(
+                data, objs, obj_metas, weighted, lod_overrides)
             if out_data is None:
                 return {"CANCELLED"}
             data = out_data
@@ -3038,14 +3661,17 @@ class EXPORT_SCENE_OT_glacier2_prim(Operator, ExportHelper):
                     continue
                 meta = obj_metas[idx]
                 mesh = o.data
-                if len(mesh.vertices) != meta["num_vertices"]:
-                    self.report({"ERROR"},
-                                "%s has %d verts but original object %d has %d. "
-                                "Vertex count must be unchanged - or enable "
-                                "'Experimental: Custom Mesh'." %
-                                (o.name, len(mesh.vertices), idx, meta["num_vertices"]))
-                    return {"CANCELLED"}
-                coords = _mesh_vertex_coords(mesh)
+                if idx in lod_overrides:
+                    coords = lod_overrides[idx]
+                else:
+                    if len(mesh.vertices) != meta["num_vertices"]:
+                        self.report({"ERROR"},
+                                    "%s has %d verts but original object %d has %d. "
+                                    "Vertex count must be unchanged - or enable "
+                                    "'Experimental: Custom Mesh'." %
+                                    (o.name, len(mesh.vertices), idx, meta["num_vertices"]))
+                        return {"CANCELLED"}
+                    coords = _mesh_vertex_coords(mesh)
                 normals = None
                 if self.recompute_normals:
                     mesh.update()
@@ -3073,8 +3699,8 @@ class EXPORT_SCENE_OT_glacier2_prim(Operator, ExportHelper):
             mat_note = self._write_materials(context, source, out_prim, base_dir)
         mat_note += self._run_generate_missing(context, base_dir)
 
-        self.report({"INFO"}, "Exported %d object(s) to %s%s%s%s" %
-                    (patched, os.path.basename(out_prim), note, wrote_meta, mat_note))
+        self.report({"INFO"}, "Exported %d object(s) to %s%s%s%s%s" %
+                    (patched, os.path.basename(out_prim), note, lod_note, wrote_meta, mat_note))
         return {"FINISHED"}
 
     def _run_generate_missing(self, context, base_dir):
@@ -3144,7 +3770,9 @@ class EXPORT_SCENE_OT_glacier2_prim(Operator, ExportHelper):
                 "colors": colors, "indices": indices,
                 "joints": joints, "weights": weights}
 
-    def _rebuild_custom(self, template, objs, obj_metas, weighted):
+    def _rebuild_custom(self, template, objs, obj_metas, weighted,
+                        lod_overrides=None):
+        lod_overrides = lod_overrides or {}
         by_index = {int(o["glacier_prim_index"]): o for o in objs}
         orig_prim = read_prim_bytes(template)
         rebuilt = []
@@ -3153,12 +3781,17 @@ class EXPORT_SCENE_OT_glacier2_prim(Operator, ExportHelper):
             if idx in by_index:
                 o = by_index[idx]
                 d = self._extract_mesh(o, meta["off"], meta["sub_type"], weighted)
-                d["changed"] = (len(o.data.vertices) != meta["num_vertices"])
+                # Apply LOD propagation: override positions for lower LODs
+                if idx in lod_overrides:
+                    d["positions"] = lod_overrides[idx]
+                d["changed"] = (len(d["positions"]) != meta["num_vertices"])
                 if d["changed"]:
                     changed += 1
                 rebuilt.append(d)
             else:
                 d = self._extract_original(orig_prim, idx, meta, weighted)
+                if idx in lod_overrides:
+                    d["positions"] = lod_overrides[idx]
                 d["changed"] = False
                 rebuilt.append(d)
         try:
@@ -3787,6 +4420,39 @@ class GlacierTexSlot(bpy.types.PropertyGroup):
     use_file: BoolProperty(default=False)
 
 
+_RENDER_ROLE_ITEMS = [
+    ("AUTO", "Auto", "Decide from the texture's name and format (BC5 = normal, etc.)"),
+    ("BASE", "Base Color", "sRGB albedo / diffuse -> Base Color"),
+    ("SRM", "SRM (Rough/Spec/Metal)",
+     "Packed map: green -> Roughness, red -> Specular, blue -> Metallic"),
+    ("NORMAL", "Normal", "Tangent-space normal map -> Normal"),
+    ("DETAIL_NORMAL", "Detail Normal", "Micro / detail normal map"),
+    ("TRANSLUCENCY", "Translucency", "Translucency / subsurface -> Subsurface"),
+    ("EMISSION", "Emission", "Emissive -> Emission"),
+    ("AO", "Ambient Occlusion", "Ambient occlusion map"),
+    ("ALPHA", "Alpha", "Opacity / alpha -> Alpha"),
+    ("SKIP", "Don't Load", "Ignore this texture when building the render material"),
+]
+
+
+class GlacierRenderSlot(bpy.types.PropertyGroup):
+    """One texture the render-material builder may pull from the reference
+    (MATI/MATB + TEXT/TEXD). The creator chooses whether to load it and what
+    it drives, independently of the export texture overrides."""
+    mati_hash: StringProperty(default="")
+    slot_name: StringProperty(default="")
+    tex_hash: StringProperty(default="")
+    texd_hash: StringProperty(default="")
+    fmt: StringProperty(default="")
+    res: StringProperty(default="")
+    enabled: BoolProperty(
+        name="Load", default=True,
+        description="Load this texture into the render material")
+    role: EnumProperty(
+        name="Role", items=_RENDER_ROLE_ITEMS, default="AUTO",
+        description="What this texture drives in the render material")
+
+
 class GlacierMatParam(bpy.types.PropertyGroup):
     mati_hash: StringProperty(default="")
     name: StringProperty(default="")
@@ -3886,7 +4552,7 @@ def build_resource_name_map(dirs, explicit=""):
     if explicit and os.path.isfile(explicit):
         files.append(explicit)
     exts = (".txt", ".json", ".csv", ".list", ".hashlist", ".hash_list", ".tsv",
-            ".meta.json", ".log", ".md")
+            ".meta.json", ".meta", ".log", ".md")
     for d in dirs:
         if not d or not os.path.isdir(d):
             continue
@@ -3904,21 +4570,24 @@ def build_resource_name_map(dirs, explicit=""):
         except Exception:
             continue
     for f in files:
+        low = f.lower()
+        # RPKG writes binary .meta (no readable path); try it as JSON first in
+        # case it is actually a JSON meta, then fall through to the text scan
+        # which harvests any embedded [assembly:/.../name.mi] path.
+        if low.endswith(".meta") or low.endswith(".json"):
+            try:
+                import json as _json
+                obj = _json.loads(open(f, "r", encoding="utf-8",
+                                       errors="ignore").read())
+                _harvest_json_names(obj, names)
+            except Exception:
+                pass
         try:
             txt = open(f, "r", encoding="utf-8", errors="ignore").read()
         except OSError:
             continue
         for m in _MI_NAME_RE.finditer(txt):
             names.setdefault(m.group(1).upper(), m.group(2).strip())
-        # JSON form (e.g. an RPKG .meta.json that carries IOI paths per reference)
-        if f.lower().endswith(".json"):
-            try:
-                import json as _json
-                obj = _json.loads(txt)
-            except Exception:
-                obj = None
-            if obj is not None:
-                _harvest_json_names(obj, names)
     return names
 
 
@@ -4688,12 +5357,158 @@ def _glacier_image_for(eff_hash, image_path=""):
     return None
 
 
-def build_glacier_blender_material(name, slots, params, images_by_slot):
-    """Create/replace a Blender material `name` with a node graph that mirrors the
-    game's skin shader: basecolor -> Base Color, SRM -> Separate -> Map Range (skin
-    roughness range) + specular/metallic, normal -> Separate -> Combine (B=1) ->
-    Normal Map, translucency -> Multiply -> Subsurface. Material parameters become
-    labelled Value nodes that drive the graph. Everything sits in titled frames."""
+def _resolve_render_roles(slots, images_by_slot):
+    """Decide which texture drives which shader role. Names are tried first
+    (mapTex_Basecolor, SRM, Normal...). Generic names (mapTexture2D_01/03/04,
+    common on non-skin shaders) fall through to 'other', so we then use the
+    texture FORMAT (BC5 is essentially always a normal map) and finally the
+    texture ORDER to fill base -> srm -> normal. Tiny constant maps (<=8px,
+    e.g. a 4x4 dummy) never drive base/srm."""
+    def fmt_of(img):
+        try:
+            return (img.get("glacier_fmt") or "").upper()
+        except Exception:
+            return ""
+
+    def is_tiny(img):
+        try:
+            return max(int(img.size[0]), int(img.size[1])) <= 8
+        except Exception:
+            return False
+
+    roles = {}
+    leftovers = []
+    for ts in slots:
+        img = images_by_slot.get(ts)
+        if img is None:
+            continue
+        r = _slot_role(ts.slot_name)
+        if r == "other":
+            # a BC5 texture is a normal map even when the slot is named generically
+            if fmt_of(img) == "BC5":
+                r = "normal" if "normal" not in roles else "detail_normal"
+                roles.setdefault(r, img)
+                continue
+            leftovers.append((ts, img))
+            continue
+        roles.setdefault(r, img)
+
+    # positional fallback for generically-named colour maps, in slot order
+    for ts, img in leftovers:
+        if is_tiny(img):
+            continue
+        for r in ("base", "srm", "normal", "detail_normal"):
+            if r not in roles:
+                roles[r] = img
+                break
+    return roles
+
+
+# ---------------------------------------------------------------------------
+# Render-material engine (Quartermaster-style, driven by raw .MATI/.TEXT data)
+# ---------------------------------------------------------------------------
+# This is a port of the "First Light Quartermaster" material approach onto the
+# data the 007 Toolkit already extracts from the game itself (texture slots,
+# shader parameters and natively-decoded TEXT/TEXD images). Instead of reading
+# an external JSON "contract", the material *family* (skin / eye / hair / fabric
+# / generic) is inferred from the shader-template name, the slot names and the
+# resolved roles, and a family-aware Principled node graph is built from there.
+_GLACIER_OWNED = "glacier_owned"
+
+_HAIR_TOKENS = ("hair", "eyebrow", "eyelash", "brow", "lash", "fur", "beard",
+                "stubble", "moustache", "mustache")
+_EYE_WET_TOKENS = ("wetness", "eye_wet", "wet_eye", "tearline", "tear_line")
+_EYE_TOKENS = ("eye", "iris", "sclera", "cornea", "eyeball", "pupil", "ocular")
+_SKIN_TOKENS = ("skin", "head", "face", "body", "neck", "torso", "arm", "leg",
+                "hand", "flesh")
+_FABRIC_TOKENS = ("cloth", "fabric", "shirt", "tshirt", "jacket", "vest", "suit",
+                  "henley", "jean", "trouser", "pant", "cuff", "sock", "glove",
+                  "boot", "shoe", "trainer", "belt", "holster", "pouch", "leather",
+                  "denim", "wool", "cotton", "outfit", "kit", "gear", "tactical",
+                  "weave")
+
+
+def _glacier_material_family(hint, roles, params_by, slots):
+    """Best-guess First-Light material family from everything we can see in the
+    raw material: the shader-template/friendly name, the texture-slot names, the
+    parameter names and which render roles resolved. Hair is tested before eye so
+    that 'eyebrow'/'eyelash' classify as hair rather than eye."""
+    parts = [(hint or "").lower()]
+    for s in (slots or []):
+        parts.append((getattr(s, "slot_name", "") or "").lower())
+    for k in (params_by or {}):
+        parts.append((k or "").lower())
+    blob = " ".join(parts)
+
+    def has(tokens):
+        return any(t in blob for t in tokens)
+
+    skin_template = "shadertemplate_01" in blob
+    if has(_EYE_WET_TOKENS):
+        return "eye_wetness"
+    if has(_HAIR_TOKENS):
+        return "hair"
+    if has(_EYE_TOKENS):
+        return "eye"
+    if skin_template or has(_SKIN_TOKENS) or "translucency" in roles:
+        return "skin"
+    if has(_FABRIC_TOKENS):
+        return "fabric"
+    return "generic"
+
+
+def _glacier_set_blend(mat, mode):
+    """Set a material's transparency mode across Blender 4.2 (EEVEE legacy,
+    `blend_method`) and 4.3 / 5.x (EEVEE-Next, `surface_render_method`). `mode`
+    is one of OPAQUE / HASHED / BLEND. Everything is guarded so a missing
+    attribute on any one version is a no-op rather than a crash."""
+    for attr, val in (("blend_method", mode),):
+        try:
+            setattr(mat, attr, val)
+        except Exception:
+            pass
+    # EEVEE-Next: DITHERED ~ alpha-hashed cutout, BLENDED ~ alpha blend
+    new_method = {"OPAQUE": "DITHERED", "HASHED": "DITHERED", "BLEND": "BLENDED"}.get(mode)
+    if new_method is not None:
+        try:
+            mat.surface_render_method = new_method
+        except Exception:
+            pass
+    for attr, val in (("show_transparent_back", mode == "BLEND"),
+                      ("use_transparency_overlap", mode == "BLEND")):
+        try:
+            setattr(mat, attr, val)
+        except Exception:
+            pass
+
+
+def _glacier_image_alpha_is_real(img):
+    """True when an image genuinely carries an alpha channel worth using as
+    opacity (4 channels). Avoids forcing transparency on opaque RGB maps."""
+    try:
+        return int(getattr(img, "channels", 0)) >= 4 or img.depth in (32, 64, 128)
+    except Exception:
+        return False
+
+
+def build_glacier_blender_material(name, slots, params, images_by_slot, roles=None):
+    """Create / replace a Blender material `name` with a family-aware Principled
+    node graph that mirrors how 007 First Light uses its textures.
+
+    The material *family* is detected (skin / eye / hair / fabric / generic) and
+    drives the shader defaults and blend policy. Then each render role is wired:
+      base        -> Base Color (x AO, x tint)
+      srm         -> Separate -> Roughness (skin range) + Specular + Metallic
+      normal      -> (BC5 rebuild B=1) -> Normal Map  (+ detail normal blended)
+      translucency-> Multiply -> Subsurface
+      emission    -> Emission Color/Strength
+      alpha       -> Alpha (+ HASHED/BLEND blend policy)
+    Material parameters become labelled Value/RGB nodes that drive the graph.
+    Branches sit in titled frames; every node we create is tagged glacier_owned.
+
+    Signature is unchanged from earlier versions so all call sites keep working:
+    `roles`, when supplied, is a dict of {role_name: image} in the 007 role
+    vocabulary (base/srm/normal/detail_normal/translucency/emission/ao/alpha)."""
     mat = bpy.data.materials.get(name)
     if mat is None:
         mat = bpy.data.materials.new(name)
@@ -4702,22 +5517,7 @@ def build_glacier_blender_material(name, slots, params, images_by_slot):
     for nd in list(nt.nodes):
         nt.nodes.remove(nd)
 
-    out = nt.nodes.new("ShaderNodeOutputMaterial"); out.location = (760, 0)
-    bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled"); bsdf.location = (380, 0)
-    bsdf.location = (380, 0)
-    nt.links.new(bsdf.outputs[0], out.inputs["Surface"])
-    # skin defaults
-    try:
-        bsdf.subsurface_method = "RANDOM_WALK"
-    except Exception:
-        pass
-    ssr = _bsdf_input(bsdf, "Subsurface Radius")
-    if ssr is not None:
-        try:
-            ssr.default_value = (1.0, 0.2, 0.1)
-        except Exception:
-            pass
-
+    roles = roles if roles is not None else _resolve_render_roles(slots, images_by_slot)
     pby = {(p.name or "").lower(): p for p in params}
 
     def pval(*keys):
@@ -4726,15 +5526,72 @@ def build_glacier_blender_material(name, slots, params, images_by_slot):
                 return pby[k]
         return None
 
-    roles = {}
-    for ts in slots:
-        img = images_by_slot.get(ts)
-        if img is not None:
-            roles.setdefault(_slot_role(ts.slot_name), img)
+    family = _glacier_material_family(name, roles, pby, slots)
+
+    # ---- core nodes ---------------------------------------------------------
+    out = nt.nodes.new("ShaderNodeOutputMaterial"); out.location = (820, 0)
+    bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled"); bsdf.location = (440, 0)
+    nt.links.new(bsdf.outputs[0], out.inputs["Surface"])
+
+    def _set(names, value):
+        s = _bsdf_input(bsdf, *names)
+        if s is not None:
+            try:
+                s.default_value = value
+            except Exception:
+                pass
+
+    # Principled defaults (Quartermaster-style preview-friendly base)
+    _set(("Metallic",), 0.0)
+    _set(("Roughness",), 0.6)
+    _set(("Specular IOR Level", "Specular"), 0.5)
+    _set(("Coat Weight", "Clearcoat"), 0.0)
+    _set(("Alpha",), 1.0)
+
+    # Family-specific shader defaults + blend policy
+    blend_mode = "OPAQUE"
+    if family == "skin":
+        try:
+            bsdf.subsurface_method = "RANDOM_WALK"
+        except Exception:
+            pass
+        ssr = _bsdf_input(bsdf, "Subsurface Radius")
+        if ssr is not None:
+            try:
+                ssr.default_value = (1.0, 0.2, 0.1)
+            except Exception:
+                pass
+        _set(("Roughness",), 0.45)
+    elif family in ("eye", "eye_wetness"):
+        _set(("Roughness",), 0.12 if family == "eye" else 0.05)
+        _set(("Specular IOR Level", "Specular"), 0.85)
+        _set(("Subsurface Weight", "Subsurface"), 0.0)
+        ior = _bsdf_input(bsdf, "IOR")
+        if ior is not None:
+            try:
+                ior.default_value = 1.4
+            except Exception:
+                pass
+    elif family == "hair":
+        _set(("Roughness",), 0.5)
+        _set(("Subsurface Weight", "Subsurface"), 0.0)
+
+    # shared UV input so every image samples the model's first UV map
+    _uv_holder = {}
+
+    def uv_socket():
+        n = _uv_holder.get("n")
+        if n is None:
+            n = nt.nodes.new("ShaderNodeUVMap")
+            n.location = (-1640, 360); n.label = "UV"
+            n[_GLACIER_OWNED] = True
+            _uv_holder["n"] = n
+        return n.outputs.get("UV")
 
     def frame(title, color=None):
         fr = nt.nodes.new("NodeFrame")
         fr.label = title
+        fr[_GLACIER_OWNED] = True
         try:
             fr.label_size = 18
             if color:
@@ -4749,9 +5606,21 @@ def build_glacier_blender_material(name, slots, params, images_by_slot):
         n.image = image
         n.location = (x, y); n.parent = parent; n.label = label
         n.width = 240
+        n[_GLACIER_OWNED] = True
         if noncolor:
             try:
                 image.colorspace_settings.name = "Non-Color"
+            except Exception:
+                pass
+        else:
+            try:
+                image.colorspace_settings.name = "sRGB"
+            except Exception:
+                pass
+        us = uv_socket()
+        if us is not None:
+            try:
+                nt.links.new(us, n.inputs["Vector"])
             except Exception:
                 pass
         return n
@@ -4759,6 +5628,7 @@ def build_glacier_blender_material(name, slots, params, images_by_slot):
     def value_node(label, v, x, y, parent):
         n = nt.nodes.new("ShaderNodeValue")
         n.label = label; n.location = (x, y); n.parent = parent
+        n[_GLACIER_OWNED] = True
         try:
             n.outputs[0].default_value = float(v)
         except Exception:
@@ -4771,54 +5641,108 @@ def build_glacier_blender_material(name, slots, params, images_by_slot):
         except Exception:
             pass
 
-    # ---- BASE COLOR ----------------------------------------------------------
-    if "base" in roles:
+    base_color_socket = None   # current node socket feeding Base Color
+
+    # ---- BASE COLOR ---------------------------------------------------------
+    base_img = roles.get("base")
+    if base_img is not None:
         fr = frame("Base Color", (0.18, 0.12, 0.10))
-        t = img_node(roles["base"], False, -1180, 520, fr, "Basecolor")
+        t = img_node(base_img, False, -1180, 520, fr, "Basecolor")
+        base_color_socket = t.outputs["Color"]
+        # Hair cards & other cutouts carry their mask in the diffuse alpha.
+        if family == "hair" and "alpha" not in roles and _glacier_image_alpha_is_real(base_img):
+            a_in = _bsdf_input(bsdf, "Alpha")
+            if a_in is not None:
+                nt.links.new(t.outputs["Alpha"], a_in)
+                blend_mode = "BLEND"
+
+    # ---- AMBIENT OCCLUSION (multiplied over base) ---------------------------
+    if base_color_socket is not None and roles.get("ao") is not None:
+        fr = frame("Ambient Occlusion", (0.12, 0.12, 0.14))
+        t = img_node(roles["ao"], True, -880, 700, fr, "AO")
+        mix = nt.nodes.new("ShaderNodeMixRGB")
+        mix.blend_type = "MULTIPLY"; mix.location = (-560, 640); mix.parent = fr
+        mix.label = "AO x Base"; mix[_GLACIER_OWNED] = True
+        try:
+            mix.inputs["Fac"].default_value = 1.0
+        except Exception:
+            pass
+        nt.links.new(base_color_socket, mix.inputs["Color1"])
+        nt.links.new(t.outputs["Color"], mix.inputs["Color2"])
+        base_color_socket = mix.outputs["Color"]
+
+    # ---- TINT / SKIN COLOUR (param) multiplied over base --------------------
+    tint = pval("skincolor", "tintcolor", "basecolor", "diffusecolor", "color")
+    if tint is not None and getattr(tint, "type", 0) == 0x03:
+        fr = frame("Tint", (0.13, 0.13, 0.13))
+        rgb = nt.nodes.new("ShaderNodeRGB")
+        rgb.location = (-880, 880); rgb.parent = fr; rgb.label = "Tint Color"
+        rgb[_GLACIER_OWNED] = True
+        try:
+            rgb.outputs[0].default_value = (tint.color[0], tint.color[1], tint.color[2], 1.0)
+        except Exception:
+            pass
+        if base_color_socket is not None:
+            mix = nt.nodes.new("ShaderNodeMixRGB")
+            mix.blend_type = "MULTIPLY"; mix.location = (-560, 860); mix.parent = fr
+            mix.label = "Tint x Base"; mix[_GLACIER_OWNED] = True
+            try:
+                mix.inputs["Fac"].default_value = 1.0
+            except Exception:
+                pass
+            nt.links.new(base_color_socket, mix.inputs["Color1"])
+            nt.links.new(rgb.outputs[0], mix.inputs["Color2"])
+            base_color_socket = mix.outputs["Color"]
+        else:
+            base_color_socket = rgb.outputs[0]
+
+    if base_color_socket is not None:
         bc = _bsdf_input(bsdf, "Base Color")
         if bc is not None:
-            nt.links.new(t.outputs["Color"], bc)
-        a_in = _bsdf_input(bsdf, "Alpha")
-        # leave Alpha at default unless a dedicated opacity map exists
+            nt.links.new(base_color_socket, bc)
 
-    # ---- SRM : Specular / Roughness / Metallic -------------------------------
-    if "srm" in roles:
+    # ---- SRM : Specular / Roughness / Metallic ------------------------------
+    if roles.get("srm") is not None:
         fr = frame("SRM  -  Specular / Roughness / Metallic", (0.10, 0.14, 0.18))
         t = img_node(roles["srm"], True, -1180, 150, fr, "SRM")
         sep = nt.nodes.new("ShaderNodeSeparateColor")
         sep.location = (-880, 170); sep.parent = fr; sep.label = "Split SRM"
+        sep[_GLACIER_OWNED] = True
         set_mode_rgb(sep)
         nt.links.new(t.outputs["Color"], sep.inputs[0])
 
-        # Roughness = green, remapped into the skin roughness range
-        mr = nt.nodes.new("ShaderNodeMapRange")
-        mr.location = (-560, 120); mr.parent = fr; mr.label = "Roughness Range"
-        try:
-            mr.clamp = True
-        except Exception:
-            pass
-        nt.links.new(sep.outputs[1], mr.inputs[0])         # Value <- Green
+        # Roughness = green. Skin remaps into the shader's roughness range.
         rmin = pval("roughness_min"); rmax = pval("roughness_max")
-        if rmin is not None:
-            vn = value_node("Roughness Min", rmin.fval, -560, 300, fr)
-            nt.links.new(vn.outputs[0], mr.inputs["To Min"])
-        else:
+        rough_socket = sep.outputs[1]
+        if family == "skin" or rmin is not None or rmax is not None:
+            mr = nt.nodes.new("ShaderNodeMapRange")
+            mr.location = (-560, 120); mr.parent = fr; mr.label = "Roughness Range"
+            mr[_GLACIER_OWNED] = True
             try:
-                mr.inputs["To Min"].default_value = 0.0
+                mr.clamp = True
             except Exception:
                 pass
-        if rmax is not None:
-            vn = value_node("Roughness Max", rmax.fval, -560, 230, fr)
-            nt.links.new(vn.outputs[0], mr.inputs["To Max"])
-        else:
-            try:
-                mr.inputs["To Max"].default_value = 1.0
-            except Exception:
-                pass
+            nt.links.new(sep.outputs[1], mr.inputs[0])
+            if rmin is not None:
+                vn = value_node("Roughness Min", rmin.fval, -560, 300, fr)
+                nt.links.new(vn.outputs[0], mr.inputs["To Min"])
+            else:
+                try:
+                    mr.inputs["To Min"].default_value = 0.0
+                except Exception:
+                    pass
+            if rmax is not None:
+                vn = value_node("Roughness Max", rmax.fval, -560, 230, fr)
+                nt.links.new(vn.outputs[0], mr.inputs["To Max"])
+            else:
+                try:
+                    mr.inputs["To Max"].default_value = 1.0
+                except Exception:
+                    pass
+            rough_socket = mr.outputs[0]
         rough = _bsdf_input(bsdf, "Roughness")
         if rough is not None:
-            nt.links.new(mr.outputs[0], rough)
-        # Specular from red, Metallic from blue
+            nt.links.new(rough_socket, rough)
         spec = _bsdf_input(bsdf, "Specular IOR Level", "Specular")
         if spec is not None:
             nt.links.new(sep.outputs[0], spec)
@@ -4826,49 +5750,74 @@ def build_glacier_blender_material(name, slots, params, images_by_slot):
         if metal is not None:
             nt.links.new(sep.outputs[2], metal)
 
-    # ---- NORMAL : Separate -> Combine (B=1) -> Normal Map --------------------
-    if "normal" in roles:
-        fr = frame("Normal", (0.10, 0.16, 0.10))
-        t = img_node(roles["normal"], True, -1180, -260, fr, "Normal")
-        sep = nt.nodes.new("ShaderNodeSeparateColor")
-        sep.location = (-880, -240); sep.parent = fr; sep.label = "Split Normal"
-        set_mode_rgb(sep)
-        nt.links.new(t.outputs["Color"], sep.inputs[0])
-        comb = nt.nodes.new("ShaderNodeCombineColor")
-        comb.location = (-620, -240); comb.parent = fr; comb.label = "Rebuild (B=1)"
-        set_mode_rgb(comb)
-        nt.links.new(sep.outputs[0], comb.inputs[0])       # R
-        nt.links.new(sep.outputs[1], comb.inputs[1])       # G
-        try:
-            comb.inputs[2].default_value = 1.0             # B = 1
-        except Exception:
-            pass
+    # ---- NORMAL (+ optional detail / micro normal) --------------------------
+    def _build_normal(image, x, y, fr, label):
+        """Image -> (rebuild B=1 for 2-channel BC5) -> Normal Map. Returns the
+        Normal Map node so detail normals can be blended afterwards."""
+        t = img_node(image, True, x, y, fr, label)
+        src = t.outputs["Color"]
+        # Game tangent-space normals are commonly BC5 (only R,G stored); rebuild
+        # the blue channel so the Normal Map node gets a valid vector.
+        if (image.get("glacier_fmt") or "").upper() == "BC5":
+            sep = nt.nodes.new("ShaderNodeSeparateColor")
+            sep.location = (x + 300, y + 20); sep.parent = fr; sep.label = "Split " + label
+            sep[_GLACIER_OWNED] = True; set_mode_rgb(sep)
+            nt.links.new(t.outputs["Color"], sep.inputs[0])
+            comb = nt.nodes.new("ShaderNodeCombineColor")
+            comb.location = (x + 560, y + 20); comb.parent = fr; comb.label = "Rebuild (B=1)"
+            comb[_GLACIER_OWNED] = True; set_mode_rgb(comb)
+            nt.links.new(sep.outputs[0], comb.inputs[0])
+            nt.links.new(sep.outputs[1], comb.inputs[1])
+            try:
+                comb.inputs[2].default_value = 1.0
+            except Exception:
+                pass
+            src = comb.outputs[0]
         nm = nt.nodes.new("ShaderNodeNormalMap")
-        nm.location = (-360, -240); nm.parent = fr; nm.label = "Normal Map"
-        nt.links.new(comb.outputs[0], nm.inputs["Color"])
-        bs = pval("norm_bumpscale", "normalstrength", "bumpscale")
+        nm.location = (x + 820, y); nm.parent = fr; nm.label = label + " Map"
+        nm[_GLACIER_OWNED] = True
+        nt.links.new(src, nm.inputs["Color"])
+        return nm
+
+    if roles.get("normal") is not None:
+        fr = frame("Normal", (0.10, 0.16, 0.10))
+        nm = _build_normal(roles["normal"], -1480, -260, fr, "Normal")
+        bs = pval("norm_bumpscale", "normalstrength", "bumpscale", "normal_intensity")
         if bs is not None:
-            vn = value_node("Normal Strength", max(0.0, abs(bs.fval)) or 1.0,
-                            -360, -60, fr)
+            vn = value_node("Normal Strength", max(0.0, abs(bs.fval)) or 1.0, -660, -60, fr)
             try:
                 nt.links.new(vn.outputs[0], nm.inputs["Strength"])
             except Exception:
                 pass
+        normal_out = nm.outputs["Normal"]
+        # Detail / micro normal: blend (add + normalize) over the primary normal.
+        if roles.get("detail_normal") is not None:
+            dnm = _build_normal(roles["detail_normal"], -1480, -560, fr, "Detail Normal")
+            add = nt.nodes.new("ShaderNodeVectorMath")
+            add.operation = "ADD"; add.location = (180, -360); add.parent = fr
+            add.label = "Combine Normals"; add[_GLACIER_OWNED] = True
+            nt.links.new(nm.outputs["Normal"], add.inputs[0])
+            nt.links.new(dnm.outputs["Normal"], add.inputs[1])
+            nrm = nt.nodes.new("ShaderNodeVectorMath")
+            nrm.operation = "NORMALIZE"; nrm.location = (360, -360); nrm.parent = fr
+            nrm.label = "Normalize"; nrm[_GLACIER_OWNED] = True
+            nt.links.new(add.outputs[0], nrm.inputs[0])
+            normal_out = nrm.outputs[0]
         nin = _bsdf_input(bsdf, "Normal")
         if nin is not None:
-            nt.links.new(nm.outputs["Normal"], nin)
+            nt.links.new(normal_out, nin)
 
     # ---- TRANSLUCENCY -> SUBSURFACE -----------------------------------------
-    if "translucency" in roles:
+    if roles.get("translucency") is not None:
         fr = frame("Translucency  ->  Subsurface", (0.17, 0.10, 0.16))
-        t = img_node(roles["translucency"], True, -1180, -640, fr, "Translucency")
+        t = img_node(roles["translucency"], True, -1180, -940, fr, "Translucency")
         mul = nt.nodes.new("ShaderNodeMath"); mul.operation = "MULTIPLY"
-        mul.location = (-760, -620); mul.parent = fr; mul.label = "Intensity"
+        mul.location = (-760, -920); mul.parent = fr; mul.label = "Intensity"
+        mul[_GLACIER_OWNED] = True
         nt.links.new(t.outputs["Color"], mul.inputs[0])
-        ti = pval("translucency_intensity", "translucency")
+        ti = pval("translucency_intensity", "translucency", "sss_intensity")
         if ti is not None:
-            vn = value_node("Translucency Intensity", max(0.0, ti.fval) or 0.3,
-                            -760, -470, fr)
+            vn = value_node("Translucency Intensity", max(0.0, ti.fval) or 0.3, -760, -770, fr)
             nt.links.new(vn.outputs[0], mul.inputs[1])
         else:
             try:
@@ -4879,10 +5828,10 @@ def build_glacier_blender_material(name, slots, params, images_by_slot):
         if ssw is not None:
             nt.links.new(mul.outputs[0], ssw)
 
-    # ---- EMISSION / ALPHA (only if the material actually has them) -----------
-    if "emission" in roles:
+    # ---- EMISSION -----------------------------------------------------------
+    if roles.get("emission") is not None:
         fr = frame("Emission", (0.18, 0.16, 0.08))
-        t = img_node(roles["emission"], False, -1180, -1020, fr, "Emission")
+        t = img_node(roles["emission"], False, -1180, -1320, fr, "Emission")
         ec = _bsdf_input(bsdf, "Emission Color", "Emission")
         if ec is not None:
             nt.links.new(t.outputs["Color"], ec)
@@ -4892,33 +5841,26 @@ def build_glacier_blender_material(name, slots, params, images_by_slot):
                 es.default_value = 1.0
             except Exception:
                 pass
-    if "alpha" in roles:
-        t = img_node(roles["alpha"], True, -1180, -1320, None, "Opacity")
+
+    # ---- ALPHA / OPACITY ----------------------------------------------------
+    if roles.get("alpha") is not None:
+        t = img_node(roles["alpha"], True, -1180, -1620, None, "Opacity")
         a = _bsdf_input(bsdf, "Alpha")
         if a is not None:
+            # a dedicated opacity map: use its colour (greyscale) as alpha
             nt.links.new(t.outputs["Color"], a)
-            try:
-                mat.blend_method = "HASHED"
-            except Exception:
-                pass
+            blend_mode = "BLEND" if family in ("hair", "eye_wetness") else "HASHED"
 
-    # ---- SKIN COLOUR (game tint param - exposed for the user) ----------------
-    sk = pval("skincolor", "tintcolor")
-    if sk is not None and getattr(sk, "type", 0) == 0x03:
-        fr = frame("Parameters", (0.13, 0.13, 0.13))
-        rgb = nt.nodes.new("ShaderNodeRGB")
-        rgb.location = (-1180, 760); rgb.parent = fr; rgb.label = "Skin Color"
-        try:
-            rgb.outputs[0].default_value = (sk.color[0], sk.color[1], sk.color[2], 1.0)
-        except Exception:
-            pass
-        # connect to Specular Tint when that socket exists (otherwise just exposed)
-        st = _bsdf_input(bsdf, "Specular Tint")
-        if st is not None:
-            try:
-                nt.links.new(rgb.outputs[0], st)
-            except Exception:
-                pass
+    _glacier_set_blend(mat, blend_mode)
+
+    # ---- debug stamp --------------------------------------------------------
+    try:
+        mat["glacier_family"] = family
+        mat["glacier_shader_name"] = name
+        mat["glacier_roles"] = ",".join(sorted(roles.keys()))
+        mat["glacier_blend"] = blend_mode
+    except Exception:
+        pass
     return mat
 def _ensure_slot_images(context, slots):
     """Make sure each slot's texture is decoded into a Blender image; decode any
@@ -4951,11 +5893,15 @@ def _ensure_slot_images(context, slots):
             dp = texd_by.get(eff)
             if dp is None and eff in pairs and pairs[eff] is not None:
                 dp = texd_by.get("%016X" % pairs[eff])
+            fmt_name = ""
             try:
                 if tp:                                   # decode TEXT (+TEXD)
+                    hdr = parse_text_header(bytearray(open(tp, "rb").read()))
+                    if hdr:
+                        fmt_name = hdr.get("format_name", "")
                     w, h, rgba = decode_texture_file(tp, dp)
                 elif dp:                                 # only a TEXD - decode headerless
-                    w, h, rgba, _f = decode_texd_standalone(dp)
+                    w, h, rgba, fmt_name = decode_texd_standalone(dp)
                 else:
                     rgba = None
                 if rgba is not None:
@@ -4965,8 +5911,91 @@ def _ensure_slot_images(context, slots):
                     img = _load_image_into_blend(outp)
             except Exception:
                 img = None
+            if img is not None and fmt_name:
+                try:
+                    img["glacier_fmt"] = fmt_name
+                except Exception:
+                    pass
+        # stamp the source texture format on the image (helps role detection,
+        # e.g. BC5 == normal map) even when the image was already loaded
+        if img is not None and "glacier_fmt" not in img and eff:
+            tp2 = text_by.get(eff)
+            if tp2:
+                try:
+                    hdr = parse_text_header(bytearray(open(tp2, "rb").read()))
+                    if hdr and hdr.get("format_name"):
+                        img["glacier_fmt"] = hdr["format_name"]
+                except Exception:
+                    pass
         result[ts] = img
     return result
+
+
+def _decode_texture_image(context, eff_hash, texd_hash="", image_path="",
+                          text_by=None, texd_by=None, pairs=None, wd=None, ext=None):
+    """Resolve (or decode) a single texture to a Blender image, by hash. Stamps
+    the source format on the image (for role detection). Shared by the override
+    build path and the reference build path."""
+    sc = context.scene
+    if text_by is None:
+        dirs = _all_texture_dirs(context)
+        text_by, texd_by = index_textures_by_hash(dirs)
+        pairs = pair_text_to_texd(dirs)
+    if wd is None:
+        wd = _glacier_work_dir(context)
+    if ext is None:
+        ext = ".png" if getattr(sc, "glacier_decode_fmt", "PNG") == "PNG" else ".tga"
+    eff = (eff_hash or "").upper()
+    img = _glacier_image_for(eff, image_path)
+    if img is None and image_path:
+        p = bpy.path.abspath(image_path)
+        if os.path.isfile(p):
+            img = _load_image_into_blend(p)
+    if img is None and eff:
+        for cand in (os.path.join(wd, eff + ".png"), os.path.join(wd, eff + ".tga")):
+            if os.path.isfile(cand):
+                img = _load_image_into_blend(cand)
+                if img is not None:
+                    break
+    fmt_name = ""
+    if img is None and eff:
+        tp = text_by.get(eff)
+        dp = texd_by.get(eff)
+        if dp is None and texd_hash:
+            dp = texd_by.get((texd_hash or "").upper())
+        if dp is None and eff in pairs and pairs[eff] is not None:
+            dp = texd_by.get("%016X" % pairs[eff])
+        try:
+            if tp:
+                hdr = parse_text_header(bytearray(open(tp, "rb").read()))
+                if hdr:
+                    fmt_name = hdr.get("format_name", "")
+                w, h, rgba = decode_texture_file(tp, dp)
+            elif dp:
+                w, h, rgba, fmt_name = decode_texd_standalone(dp)
+            else:
+                rgba = None
+            if rgba is not None:
+                os.makedirs(wd, exist_ok=True)
+                outp = os.path.join(wd, "%s%s" % (eff, ext))
+                (write_png if ext == ".png" else write_tga)(outp, w, h, rgba)
+                img = _load_image_into_blend(outp)
+        except Exception:
+            img = None
+    if img is not None and "glacier_fmt" not in img:
+        if not fmt_name and eff and text_by.get(eff):
+            try:
+                hdr = parse_text_header(bytearray(open(text_by[eff], "rb").read()))
+                if hdr:
+                    fmt_name = hdr.get("format_name", "")
+            except Exception:
+                pass
+        if fmt_name:
+            try:
+                img["glacier_fmt"] = fmt_name
+            except Exception:
+                pass
+    return img
 
 
 def _ordered_model_material_keys(context):
@@ -5100,6 +6129,81 @@ class GLACIER_OT_generate_missing(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class GLACIER_UL_render_slots(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data,
+                  active_propname, index):
+        row = layout.row(align=True)
+        row.prop(item, "enabled", text="")
+        sub = row.row()
+        sub.active = item.enabled
+        sub.label(text=item.slot_name or item.tex_hash[:10])
+        meta = (item.res + "  " + item.fmt).strip()
+        if meta:
+            r = sub.row(); r.alignment = "RIGHT"
+            r.label(text=meta)
+
+
+class GLACIER_OT_pull_reference(bpy.types.Operator):
+    bl_idname = "glacier.pull_reference"
+    bl_label = "Pull From Reference"
+    bl_description = ("Read the textures the material(s) reference (.MATI/.MATB + their "
+                      ".TEXT/.TEXD) and list them here, so you can pick exactly which "
+                      "ones load into the render material and what each one drives. This "
+                      "is independent of the export texture overrides")
+
+    apply_to: bpy.props.EnumProperty(
+        name="From",
+        items=[("MODEL", "Whole Model", "Every loaded material"),
+               ("ACTIVE", "Active Material", "Just the active material")],
+        default="MODEL")
+
+    def execute(self, context):
+        sc = context.scene
+        mats = [mt for mt in sc.glacier_materials if not mt.is_blueprint]
+        if not mats:
+            self.report({"WARNING"}, "Load a material first (Materials section)")
+            return {"CANCELLED"}
+        if self.apply_to == "ACTIVE":
+            mats = [mt for mt in mats if mt.key == sc.glacier_active_material] or mats[:1]
+        keys = {mt.key for mt in mats}
+        for i in range(len(sc.glacier_render_slots) - 1, -1, -1):
+            if sc.glacier_render_slots[i].mati_hash in keys:
+                sc.glacier_render_slots.remove(i)
+
+        dirs = _all_texture_dirs(context)
+        text_by, _texd_by = index_textures_by_hash(dirs)
+        n = 0
+        for mt in mats:
+            for ts in sc.glacier_tex_slots:
+                if ts.mati_hash != mt.key:
+                    continue
+                tex_hash = (ts.old_hash or "").upper()
+                fmt, res = "", ""
+                tp = text_by.get(tex_hash)
+                if tp:
+                    try:
+                        hdr = parse_text_header(bytearray(open(tp, "rb").read()))
+                        if hdr:
+                            fmt = hdr.get("format_name", "")
+                            res = "%dx%d" % (hdr["width"], hdr["height"])
+                    except Exception:
+                        pass
+                rs = sc.glacier_render_slots.add()
+                rs.mati_hash = mt.key
+                rs.slot_name = ts.slot_name
+                rs.tex_hash = tex_hash
+                rs.texd_hash = (ts.texd_hash or "").upper()
+                rs.fmt = fmt
+                rs.res = res
+                rs.enabled = True
+                rs.role = "AUTO"
+                n += 1
+        sc.glacier_render_from_reference = True
+        self.report({"INFO"}, "Pulled %d texture(s) from reference. Pick what loads, "
+                    "then Build Render Materials." % n)
+        return {"FINISHED"}
+
+
 class GLACIER_OT_build_materials(bpy.types.Operator):
     bl_idname = "glacier.build_materials"
     bl_label = "Build Render Materials"
@@ -5133,16 +6237,70 @@ class GLACIER_OT_build_materials(bpy.types.Operator):
 
         built = {}                       # material key -> bpy material
         missing = []                     # slots whose image couldn't be found
+        use_ref = getattr(sc, "glacier_render_from_reference", False)
+        ref_dirs = ref_text = ref_texd = ref_pairs = ref_wd = ref_ext = None
+        # Many model parts share the same shader label (e.g. "gm_mTransform2D_01").
+        # Without disambiguation every such part resolves to ONE Blender material
+        # datablock and they overwrite each other, so only the last survives.
+        # Count labels across ALL loaded materials (not just this build batch) so
+        # the suffix is applied even when building one material at a time in
+        # "Active" mode - otherwise Active builds would still collide.
+        _all_mats = [m for m in sc.glacier_materials if not m.is_blueprint]
+        _label_counts = {}
+        for _mt in _all_mats:
+            _lbl = _mt.label or _mt.key[:8]
+            _label_counts[_lbl] = _label_counts.get(_lbl, 0) + 1
         for mt in mats:
-            slots = [ts for ts in sc.glacier_tex_slots if ts.mati_hash == mt.key]
             params = [p for p in sc.glacier_params if p.mati_hash == mt.key]
-            imgs = _ensure_slot_images(context, slots)
-            for ts in slots:
-                if imgs.get(ts) is None:
-                    missing.append(ts.slot_name)
-            name = "007_%s" % (mt.label or mt.key[:8])
+            _lbl = mt.label or mt.key[:8]
+            name = "007_%s" % _lbl
+            # Disambiguate when the label is shared OR is a raw engine shader
+            # template (gm_m... / Transform2D), which is exactly the case that
+            # used to collapse many parts onto one material datablock.
+            _generic = _lbl.lower().startswith("gm_m") or "transform2d" in _lbl.lower()
+            if _label_counts.get(_lbl, 0) > 1 or _generic:
+                name = "%s [%s]" % (name, (mt.key or "")[:6])
+            ref_slots = [rs for rs in sc.glacier_render_slots
+                         if rs.mati_hash == mt.key and rs.enabled and rs.role != "SKIP"]
             try:
-                bmat = build_glacier_blender_material(name, slots, params, imgs)
+                if use_ref and ref_slots:
+                    # build strictly from the chosen reference textures
+                    if ref_text is None:
+                        ref_dirs = _all_texture_dirs(context)
+                        ref_text, ref_texd = index_textures_by_hash(ref_dirs)
+                        ref_pairs = pair_text_to_texd(ref_dirs)
+                        ref_wd = _glacier_work_dir(context)
+                        ref_ext = (".png" if getattr(sc, "glacier_decode_fmt", "PNG")
+                                   == "PNG" else ".tga")
+                    roles, auto_slots, auto_imgs = {}, [], {}
+                    for rs in ref_slots:
+                        img = _decode_texture_image(
+                            context, rs.tex_hash, rs.texd_hash, "",
+                            ref_text, ref_texd, ref_pairs, ref_wd, ref_ext)
+                        if img is None:
+                            missing.append(rs.slot_name or rs.tex_hash[:8])
+                            continue
+                        if rs.fmt and "glacier_fmt" not in img:
+                            try:
+                                img["glacier_fmt"] = rs.fmt
+                            except Exception:
+                                pass
+                        if rs.role == "AUTO":
+                            auto_slots.append(rs)
+                            auto_imgs[rs] = img
+                        else:
+                            roles.setdefault(rs.role.lower(), img)
+                    if auto_slots:
+                        for r, img in _resolve_render_roles(auto_slots, auto_imgs).items():
+                            roles.setdefault(r, img)
+                    bmat = build_glacier_blender_material(name, [], params, {}, roles=roles)
+                else:
+                    slots = [ts for ts in sc.glacier_tex_slots if ts.mati_hash == mt.key]
+                    imgs = _ensure_slot_images(context, slots)
+                    for ts in slots:
+                        if imgs.get(ts) is None:
+                            missing.append(ts.slot_name)
+                    bmat = build_glacier_blender_material(name, slots, params, imgs)
             except Exception as e:
                 self.report({"WARNING"}, "Couldn't build '%s' (%s)" % (name, e))
                 continue
@@ -5377,6 +6535,65 @@ class GLACIER_OT_load_material_file(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class GLACIER_OT_update_names(bpy.types.Operator):
+    bl_idname = "glacier.update_names"
+    bl_label = "Update Names"
+    bl_description = ("Re-read the Names file (and the material folders) and refresh the "
+                      "readable names on every loaded material. Use it after you point "
+                      "the Names field at a different file/folder, or after the file "
+                      "changed on disk - no need to reload the materials")
+
+    def execute(self, context):
+        sc = context.scene
+        if not len(sc.glacier_materials):
+            self.report({"WARNING"}, "Load some materials first")
+            return {"CANCELLED"}
+
+        # search the Names file, plus every folder we know about (incl. each
+        # material's own folder), so a moved/renamed names file is still found
+        dirs = []
+        for attr in ("glacier_scan_folder", "glacier_tex_folder", "glacier_work_dir"):
+            p = bpy.path.abspath(getattr(sc, attr, "") or "")
+            if p and os.path.isdir(p) and p not in dirs:
+                dirs.append(p)
+        for mt in sc.glacier_materials:
+            d = os.path.dirname(mt.path) if mt.path else ""
+            if d and os.path.isdir(d) and d not in dirs:
+                dirs.append(d)
+        explicit = bpy.path.abspath(getattr(sc, "glacier_names_file", "") or "")
+        if explicit and os.path.isdir(explicit):
+            # allow pointing the Names field at a folder of .meta.json / hashlists
+            if explicit not in dirs:
+                dirs.append(explicit)
+            explicit = ""
+        name_map = build_resource_name_map(dirs, explicit)
+
+        changed = 0
+        for mt in sc.glacier_materials:
+            if mt.is_blueprint:
+                continue
+            new_label = None
+            if name_map and mt.key and mt.key.upper() in name_map:
+                new_label = _pretty_material_name(name_map[mt.key.upper()])
+            elif mt.path and os.path.isfile(mt.path):
+                try:
+                    mati = parse_mati(bytearray(open(mt.path, "rb").read()))
+                    new_label = _mati_display_name(mati, mt.key)
+                except Exception:
+                    new_label = None
+            if new_label and new_label != mt.label:
+                mt.label = new_label
+                changed += 1
+
+        if not name_map:
+            self.report({"WARNING"}, "No names found. Point the Names field at a hash "
+                        "list / dependency .txt, or a folder of .meta.json files.")
+            return {"CANCELLED"}
+        self.report({"INFO"}, ("Updated %d material name(s)" % changed) if changed
+                    else "Names are already up to date")
+        return {"FINISHED"}
+
+
 class GLACIER_OT_scan_folder(bpy.types.Operator):
     bl_idname = "glacier.scan_folder"
     bl_label = "Scan Folder for Materials & Textures"
@@ -5568,6 +6785,373 @@ class GLACIER_OT_inspect_texture(bpy.types.Operator):
         return {"FINISHED"}
 
 
+# =============================================================================
+# RPKG Chunk Browser  (mass-import TEXT/TEXD straight from a game chunk)
+# =============================================================================
+class GlacierChunkEntry(bpy.types.PropertyGroup):
+    """One resource row shown in the chunk browser."""
+    hash: bpy.props.StringProperty()
+    ext: bpy.props.StringProperty()
+    size: bpy.props.IntProperty()          # uncompressed size (display only)
+    sel: bpy.props.BoolProperty(name="", default=False)
+
+
+_CHUNK_FILTER_ITEMS = [
+    ("TEXTD", "TEXT + TEXD", "Textures only - both halves"),
+    ("TEXT", "TEXT only", "Small texture headers"),
+    ("TEXD", "TEXD only", "Full-resolution texture data"),
+    ("ALL", "Everything", "Every resource type in the chunk"),
+]
+_CHUNK_FILTER_EXTS = {
+    "TEXTD": {"TEXT", "TEXD"},
+    "TEXT": {"TEXT"},
+    "TEXD": {"TEXD"},
+    "ALL": None,
+}
+# how many rows we put in the on-screen list (extraction is NOT limited by this)
+_CHUNK_UI_CAP = 4000
+
+
+class GLACIER_UL_chunk_entries(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active, prop):
+        row = layout.row(align=True)
+        row.prop(item, "sel", text="")
+        row.label(text=item.hash, icon="FILE")
+        r = row.row(); r.alignment = "RIGHT"
+        r.label(text="%s  %s" % (item.ext, _human_size(item.size)))
+
+
+def _human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return "%.0f%s" % (n, unit) if unit == "B" else "%.1f%s" % (n, unit)
+        n /= 1024.0
+    return "%dB" % n
+
+
+def _chunk_populate(context):
+    """(Re)build the on-screen list from the cached parse, honouring filter +
+    search. Returns (shown, total_matching)."""
+    sc = context.scene
+    path = bpy.path.abspath(sc.glacier_chunk_path or "")
+    sc.glacier_chunk_entries.clear()
+    if not path or not os.path.isfile(path):
+        return 0, 0
+    arc = rpkg_open_cached(path)
+    exts = _CHUNK_FILTER_EXTS.get(sc.glacier_chunk_filter, None)
+    matches = arc.filter(exts, sc.glacier_chunk_search)
+    for e in matches[:_CHUNK_UI_CAP]:
+        it = sc.glacier_chunk_entries.add()
+        it.hash = e["hash"]; it.ext = e["ext"]
+        it.size = min(e["size_uncompressed"], 0x7FFFFFFF)
+        it.sel = False
+    return min(len(matches), _CHUNK_UI_CAP), len(matches)
+
+
+class GLACIER_OT_chunk_scan(bpy.types.Operator):
+    bl_idname = "glacier.chunk_scan"
+    bl_label = "Scan Chunk"
+    bl_description = ("Read the chunk's index and list its TEXT/TEXD (or all) "
+                     "resources. Point at the full chunkNN.rpkg in the game's "
+                     "Runtime folder")
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        sc = context.scene
+        path = bpy.path.abspath(sc.glacier_chunk_path or "")
+        if not path or not os.path.isfile(path):
+            self.report({"ERROR"}, "Pick a chunk .rpkg file first")
+            return {"CANCELLED"}
+        try:
+            arc = rpkg_open_cached(path)
+        except Exception as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+        shown, total = _chunk_populate(context)
+        sc.glacier_chunk_total = len(arc.entries)
+        sc.glacier_chunk_shown = shown
+        sc.glacier_chunk_matching = total
+        note = "" if shown >= total else " (showing first %d - narrow with Search)" % shown
+        self.report({"INFO"}, "Chunk has %d resources; %d match filter%s" %
+                    (len(arc.entries), total, note))
+        return {"FINISHED"}
+
+
+class GLACIER_OT_chunk_refresh(bpy.types.Operator):
+    bl_idname = "glacier.chunk_refresh"
+    bl_label = "Apply Filter"
+    bl_description = "Re-apply the type filter and hash search to the list"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        sc = context.scene
+        path = bpy.path.abspath(sc.glacier_chunk_path or "")
+        if not path or not os.path.isfile(path):
+            self.report({"ERROR"}, "Scan a chunk first")
+            return {"CANCELLED"}
+        shown, total = _chunk_populate(context)
+        sc.glacier_chunk_shown = shown
+        sc.glacier_chunk_matching = total
+        return {"FINISHED"}
+
+
+class GLACIER_OT_chunk_select(bpy.types.Operator):
+    bl_idname = "glacier.chunk_select"
+    bl_label = "Select"
+    bl_description = "Tick or untick the shown rows"
+    bl_options = {"REGISTER"}
+    mode: bpy.props.StringProperty(default="ALL")
+
+    def execute(self, context):
+        val = (self.mode == "ALL")
+        for it in context.scene.glacier_chunk_entries:
+            it.sel = val
+        return {"FINISHED"}
+
+
+_HASH_RE = re.compile(r'[0-9A-Fa-f]{16}')
+
+
+class GLACIER_OT_chunk_paste_select(bpy.types.Operator):
+    bl_idname = "glacier.chunk_paste_select"
+    bl_label = "Select From List"
+    bl_description = ("Parse the Hash List field for 16-hex hashes and tick every "
+                     "matching row. Accepts any separator (newline, comma, space, "
+                     "tab) and ignores file extensions")
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        sc = context.scene
+        txt = sc.glacier_chunk_paste_hashes or ""
+        want = set(m.group().upper() for m in _HASH_RE.finditer(txt))
+        if not want:
+            self.report({"WARNING"}, "No 16-hex hashes found in the list. Paste "
+                        "hashes like 01673C4916558956, one per line or separated "
+                        "by commas/spaces")
+            return {"CANCELLED"}
+        found = 0
+        for it in sc.glacier_chunk_entries:
+            if it.hash.upper() in want:
+                it.sel = True
+                found += 1
+        missing = len(want) - found
+        msg = "Selected %d of %d pasted hash%s" % (found, len(want),
+                                                    "es" if len(want) != 1 else "")
+        if missing:
+            msg += " (%d not in the current list — check the filter)" % missing
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
+def _chunk_decode_pair(context, out_dir, text_path, texd_path):
+    """Best-effort: decode an extracted TEXT(+paired TEXD) to a PNG via the
+    existing codec. Non-fatal."""
+    try:
+        eff = hash_from_path(text_path) if text_path else ""
+        text_by, texd_by = index_textures_by_hash([out_dir])
+        pairs = pair_text_to_texd([out_dir])
+        img = _decode_texture_image(context, eff or "", "", text_path or "",
+                                    text_by, texd_by, pairs, out_dir, "png")
+        return img is not None
+    except Exception:
+        return False
+
+
+class GLACIER_OT_chunk_extract(bpy.types.Operator):
+    bl_idname = "glacier.chunk_extract"
+    bl_label = "Import Selected"
+    bl_description = ("Extract the ticked resources (descramble + decompress) to "
+                     "the output folder as <hash>.<EXT> plus their .meta")
+    bl_options = {"REGISTER"}
+    # SELECTED = ticked rows; ALLMATCH = every resource matching the filter
+    scope: bpy.props.StringProperty(default="SELECTED")
+
+    def execute(self, context):
+        sc = context.scene
+        path = bpy.path.abspath(sc.glacier_chunk_path or "")
+        if not path or not os.path.isfile(path):
+            self.report({"ERROR"}, "Scan a chunk first")
+            return {"CANCELLED"}
+        out_dir = bpy.path.abspath(sc.glacier_chunk_out or sc.glacier_work_dir or "")
+        if not out_dir:
+            self.report({"ERROR"}, "Set an output folder (Chunk Out or Work)")
+            return {"CANCELLED"}
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError as e:
+            self.report({"ERROR"}, "Cannot create output folder: %s" % e)
+            return {"CANCELLED"}
+
+        try:
+            arc = rpkg_open_cached(path)
+        except Exception as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+
+        # custom XOR key override (hex), else the default
+        key = RPKG_XOR_KEY
+        kh = (sc.glacier_chunk_xor_key or "").strip().replace(" ", "")
+        if kh:
+            try:
+                key = bytes.fromhex(kh)
+            except ValueError:
+                self.report({"ERROR"}, "XOR key must be hex (e.g. DC45A69C...)")
+                return {"CANCELLED"}
+
+        if self.scope == "ALLMATCH":
+            exts = _CHUNK_FILTER_EXTS.get(sc.glacier_chunk_filter, None)
+            targets = arc.filter(exts, sc.glacier_chunk_search)
+        else:
+            want = {it.hash for it in sc.glacier_chunk_entries if it.sel}
+            targets = [arc.by_hash[h] for h in want if h in arc.by_hash]
+        if not targets:
+            self.report({"WARNING"}, "Nothing selected to extract")
+            return {"CANCELLED"}
+
+        organize = sc.glacier_organize_textures
+        written = 0
+        text_paths = []
+        warned_garbled = False
+        for e in targets:
+            try:
+                data = arc.extract(e, key)
+            except Exception:
+                continue
+            sub = os.path.join(out_dir, e["ext"], e["hash"]) if organize else out_dir
+            try:
+                os.makedirs(sub, exist_ok=True)
+            except OSError:
+                sub = out_dir
+            res_path = os.path.join(sub, "%s.%s" % (e["hash"], e["ext"]))
+            try:
+                with open(res_path, "wb") as f:
+                    f.write(data)
+                with open(os.path.join(sub, "%s_%s.meta" % (e["hash"], e["ext"])),
+                          "wb") as f:
+                    f.write(arc.standalone_meta(e))
+                written += 1
+                if e["ext"] == "TEXT":
+                    text_paths.append(res_path)
+                    if not warned_garbled and not _looks_like_text(data):
+                        warned_garbled = True
+            except OSError:
+                continue
+
+        # optional decode of extracted TEXT(+paired TEXD) to PNG
+        dec = 0
+        if sc.glacier_chunk_decode and text_paths:
+            for tp in text_paths:
+                if _chunk_decode_pair(context, out_dir, tp, ""):
+                    dec += 1
+
+        msg = "Extracted %d resource(s) to %s" % (written, os.path.basename(out_dir) or out_dir)
+        if dec:
+            msg += ", decoded %d to PNG" % dec
+        if warned_garbled:
+            msg += ". NOTE: a TEXT header looks wrong - the XOR key may differ; " \
+                   "try clearing/changing the XOR Key field"
+            self.report({"WARNING"}, msg)
+        else:
+            self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
+def _looks_like_text(data):
+    """Sanity check an extracted .TEXT so we can warn if the descramble key is
+    wrong. Uses the same header parser the rest of the toolkit relies on."""
+    try:
+        info = parse_text_header(data)
+        return bool(info) and 0 < info.get("width", 0) <= 16384 \
+            and 0 < info.get("height", 0) <= 16384
+    except Exception:
+        return False
+
+
+class GLACIER_OT_chunk_browser(bpy.types.Operator):
+    bl_idname = "glacier.chunk_browser"
+    bl_label = "Open Chunk Browser"
+    bl_description = ("Open a window to browse the chunk's resources and mass-"
+                     "import TEXT/TEXD without RPKG-Tool")
+    bl_options = {"REGISTER"}
+
+    def invoke(self, context, event):
+        sc = context.scene
+        path = bpy.path.abspath(sc.glacier_chunk_path or "")
+        if path and os.path.isfile(path) and not len(sc.glacier_chunk_entries):
+            try:
+                rpkg_open_cached(path)
+                shown, total = _chunk_populate(context)
+                sc.glacier_chunk_shown = shown
+                sc.glacier_chunk_matching = total
+            except Exception as e:
+                self.report({"ERROR"}, str(e))
+        return context.window_manager.invoke_props_dialog(self, width=640)
+
+    def draw(self, context):
+        sc = context.scene
+        layout = self.layout
+        box = layout.box()
+        box.label(text="RPKG Chunk Browser", icon="FILEBROWSER")
+        box.prop(sc, "glacier_chunk_path", text="Chunk")
+        row = box.row(align=True)
+        row.prop(sc, "glacier_chunk_filter", text="")
+        row.prop(sc, "glacier_chunk_search", text="", icon="VIEWZOOM")
+        row.operator("glacier.chunk_scan", text="Scan", icon="FILE_REFRESH")
+        row.operator("glacier.chunk_refresh", text="", icon="FILTER")
+
+        if len(sc.glacier_chunk_entries):
+            info = box.row()
+            info.enabled = False
+            cap = "" if sc.glacier_chunk_shown >= sc.glacier_chunk_matching \
+                else " of %d (narrow with Search)" % sc.glacier_chunk_matching
+            info.label(text="Showing %d%s  -  chunk total %d" %
+                       (sc.glacier_chunk_shown, cap, sc.glacier_chunk_total))
+            box.template_list("GLACIER_UL_chunk_entries", "", sc,
+                              "glacier_chunk_entries", sc, "glacier_chunk_index",
+                              rows=12)
+            selrow = box.row(align=True)
+            op = selrow.operator("glacier.chunk_select", text="Select All")
+            op.mode = "ALL"
+            op = selrow.operator("glacier.chunk_select", text="Select None")
+            op.mode = "NONE"
+
+            pb = box.box()
+            pb.label(text="Paste Hash List", icon="PASTEDOWN")
+            pb.prop(sc, "glacier_chunk_paste_hashes", text="")
+            r = pb.row(); r.enabled = False
+            r.label(text="Paste hashes (one per line, or comma/space separated)")
+            pb.operator("glacier.chunk_paste_select", text="Select Pasted Hashes",
+                        icon="CHECKMARK")
+        else:
+            box.label(text="Pick a chunk and press Scan", icon="INFO")
+
+        outb = layout.box()
+        outb.label(text="Extract To", icon="EXPORT")
+        outb.prop(sc, "glacier_chunk_out", text="Folder")
+        r = outb.row()
+        r.enabled = False
+        r.label(text="Blank = use the Work folder. Writes <hash>.TEXT/.TEXD + .meta")
+        outb.prop(sc, "glacier_chunk_decode")
+        outb.prop(sc, "glacier_organize_textures", text="Sort into TYPE/<hash>/")
+        adv = outb.row()
+        adv.prop(sc, "glacier_chunk_xor_key", text="XOR Key")
+        a2 = outb.row(); a2.enabled = False
+        a2.label(text="Advanced: leave blank for the default First Light key")
+
+        act = layout.row(align=True)
+        op = act.operator("glacier.chunk_extract", text="Import Selected",
+                          icon="IMPORT")
+        op.scope = "SELECTED"
+        op = act.operator("glacier.chunk_extract", text="Import All Matching",
+                          icon="IMPORT")
+        op.scope = "ALLMATCH"
+
+    def execute(self, context):
+        # closing the dialog with OK does nothing destructive; extraction is via
+        # the explicit buttons so the window stays open while you work.
+        return {"FINISHED"}
+
+
 class VIEW3D_PT_glacier_mesh_tools(bpy.types.Panel):
     bl_label = "007 Mesh Tools"
     bl_idname = "VIEW3D_PT_glacier_mesh_tools"
@@ -5585,68 +7169,146 @@ class VIEW3D_PT_glacier_mesh_tools(bpy.types.Panel):
         vr.alignment = "RIGHT"
         vr.label(text="007 Toolkit  v%s" % ver, icon="CHECKMARK")
 
-        def section(prop, title, icon, badge=None):
+        def section(prop, title, icon, badge=None, disabled=False):
             box = layout.box()
             head = box.row(align=True)
+            if disabled:
+                head.enabled = False        # grey out the whole header + toggle
             head.prop(sc, prop, text="", emboss=False,
-                      icon="TRIA_DOWN" if getattr(sc, prop) else "TRIA_RIGHT")
+                      icon="TRIA_DOWN" if (getattr(sc, prop) and not disabled)
+                      else "TRIA_RIGHT")
             head.label(text=title, icon=icon)
-            if badge:
+            if disabled:
+                r = head.row(); r.alignment = "RIGHT"; r.enabled = False
+                r.label(text="dev build only")
+            elif badge:
                 r = head.row(); r.alignment = "RIGHT"; r.label(text=str(badge))
+            if disabled:
+                return None                 # never expands in the public build
             return box.column() if getattr(sc, prop) else None
+
+        def sub(parent, title, icon="DOT"):
+            box = parent.box()
+            box.label(text=title, icon=icon)
+            return box
+
+        def hint(parent, text, icon="FILE_BLANK"):
+            # a greyed-out helper line (e.g. which file types to point at)
+            r = parent.row()
+            r.enabled = False
+            r.label(text=text, icon=icon)
 
         nmat = len(sc.glacier_materials)
         groups = _glacier_lod_groups(context)
+        active = sc.glacier_active_material
 
         # ============ IMPORT / EXPORT =====================================
         b = section("glacier_show_io", "Import / Export", "IMPORT")
         if b:
-            col = b.column(align=True)
-            col.scale_y = 1.2
+            sb = sub(b, "Import", "IMPORT")
+            col = sb.column(align=True); col.scale_y = 1.15
             col.operator("import_scene.glacier2_007_prim",
-                         text="Import Model", icon="MESH_MONKEY")
+                         text="Import Model  (.prim)", icon="MESH_MONKEY")
             col.operator("import_scene.glacier2_007_borg",
-                         text="Import Skeleton", icon="ARMATURE_DATA")
-            b.separator()
-            col = b.column(align=True)
-            col.scale_y = 1.2
+                         text="Import Skeleton  (.borg)", icon="ARMATURE_DATA")
+            sb = sub(b, "Export", "EXPORT")
+            col = sb.column(align=True); col.scale_y = 1.15
             col.operator("export_scene.glacier2_007_prim",
                          text="Export Model + Edits", icon="EXPORT")
+            hint(sb, "Writes .prim / .MATI / .TEXT / .TEXD + metas")
 
         # ============ MATERIALS ===========================================
         b = section("glacier_show_mats", "Materials", "MATERIAL", nmat or None)
         if b:
-            b.operator("glacier.override_refresh",
-                       text="Load From Imported Model", icon="FILE_REFRESH")
-            box = b.box()
-            box.label(text="Scan a folder", icon="VIEWZOOM")
-            box.prop(sc, "glacier_scan_folder", text="")
-            box.prop(sc, "glacier_scan_model_only")
-            box.operator("glacier.scan_folder", text="Scan Folder", icon="ZOOM_ALL")
-            box = b.box()
-            box.label(text="Single file / names", icon="FILE")
-            row = box.row(align=True)
+            sb = sub(b, "From Imported Model", "FILE_REFRESH")
+            sb.operator("glacier.override_refresh",
+                        text="Load From Imported Model", icon="FILE_REFRESH")
+            hint(sb, "Uses the materials of the .prim you imported")
+            sb = sub(b, "Scan a Folder", "VIEWZOOM")
+            hint(sb, "Folder of extracted files (.MATI / .TEXT / .TEXD)", "FILE_FOLDER")
+            sb.prop(sc, "glacier_scan_folder", text="")
+            sb.prop(sc, "glacier_scan_model_only")
+            sb.operator("glacier.scan_folder", text="Scan Folder", icon="ZOOM_ALL")
+            sb = sub(b, "Single File", "FILE")
+            hint(sb, "Pick one .MATI (full material) or .MATB (schema)")
+            row = sb.row(align=True)
             row.prop(sc, "glacier_mat_file", text="")
             row.operator("glacier.load_material_file", text="", icon="FILEBROWSER")
-            box.prop(sc, "glacier_names_file", text="Names")
+            sb = sub(b, "Names File (optional)", "SYNTAX_OFF")
+            hint(sb, "Shows real names instead of hashes")
+            row = sb.row(align=True)
+            row.prop(sc, "glacier_names_file", text="")
+            row.operator("glacier.update_names", text="", icon="FILE_REFRESH")
+            sb.operator("glacier.update_names", text="Update Names", icon="FILE_REFRESH")
+            hint(sb, "A hash list / dependency .txt, or a folder of .meta.json")
+            hint(sb, "Get one: RPKG-Tool > Generate Hash List, or your", "QUESTION")
+            hint(sb, "extracted .meta.json files (they hold the IOI paths)", "BLANK1")
             if nmat:
-                b.separator()
-                b.template_list("GLACIER_UL_materials", "", sc, "glacier_materials",
-                                sc, "glacier_materials_index", rows=5)
+                sb = sub(b, "Loaded Materials", "PRESET")
+                sb.template_list("GLACIER_UL_materials", "", sc, "glacier_materials",
+                                 sc, "glacier_materials_index", rows=5)
 
-        # ============ RENDER ==============================================
+        # ============ RENDER MATERIALS ====================================
         b = section("glacier_show_render", "Render Materials", "SHADING_RENDERED",
                     nmat or None)
         if b:
             if not nmat:
                 b.label(text="Load a material first", icon="INFO")
             else:
-                b.prop(sc, "glacier_build_scope", text="")
-                op = b.operator("glacier.build_materials",
-                                text="Build Render Materials", icon="NODE_MATERIAL")
+                sb = sub(b, "Build", "NODE_MATERIAL")
+                sb.prop(sc, "glacier_build_scope", text="")
+                src_on = getattr(sc, "glacier_render_from_reference", False)
+                n_ref = len([rs for rs in sc.glacier_render_slots])
+                sb.label(text="Source: %s" % ("Reference list" if (src_on and n_ref)
+                         else "Texture overrides"),
+                         icon="PRESET" if (src_on and n_ref) else "TEXTURE")
+                op = sb.operator("glacier.build_materials",
+                                 text="Build Render Materials", icon="NODE_MATERIAL")
                 op.apply_to = sc.glacier_build_scope
-                b.operator("glacier.set_shading",
-                           text="Material Preview", icon="SHADING_TEXTURE")
+                sb = sub(b, "View", "SHADING_TEXTURE")
+                sb.operator("glacier.set_shading",
+                            text="Material Preview", icon="SHADING_TEXTURE")
+
+        # ============ RENDER SOURCE (Pull from Reference) =================
+        b = section("glacier_show_source", "Render Source", "PRESET",
+                    nmat or None)
+        if b:
+            if not nmat:
+                b.label(text="Load a material first", icon="INFO")
+            else:
+                sb = sub(b, "Pull From Reference", "IMPORT")
+                sb.label(text="Auto-fill from .MATI / .MATB + .TEXT / .TEXD",
+                         icon="INFO")
+                row = sb.row(align=True)
+                op = row.operator("glacier.pull_reference",
+                                  text="Whole Model", icon="IMPORT")
+                op.apply_to = "MODEL"
+                op = row.operator("glacier.pull_reference",
+                                  text="Active Only", icon="IMPORT")
+                op.apply_to = "ACTIVE"
+                sb.prop(sc, "glacier_render_from_reference")
+
+                mine = [rs for rs in sc.glacier_render_slots if rs.mati_hash == active]
+                sb = sub(b, "Textures For This Material", "TEXTURE")
+                sb.prop(sc, "glacier_active_material", text="")
+                if not mine:
+                    sb.label(text="Press Pull From Reference above", icon="INFO")
+                else:
+                    sb.label(text="Tick = load it. Set what each one drives:")
+                    for rs in sc.glacier_render_slots:
+                        if rs.mati_hash != active:
+                            continue
+                        tb = sb.box()
+                        hr = tb.row(align=True)
+                        hr.prop(rs, "enabled", text="")
+                        nm = hr.row(); nm.active = rs.enabled
+                        nm.label(text=rs.slot_name or rs.tex_hash[:10])
+                        meta = (rs.res + "  " + rs.fmt).strip()
+                        if meta:
+                            mr = nm.row(); mr.alignment = "RIGHT"
+                            mr.label(text=meta)
+                        rr = tb.row(); rr.active = rs.enabled
+                        rr.prop(rs, "role", text="")
 
         # ============ EDIT MATERIAL =======================================
         b = section("glacier_show_edit", "Edit Material", "RESTRICT_SELECT_OFF")
@@ -5654,17 +7316,15 @@ class VIEW3D_PT_glacier_mesh_tools(bpy.types.Panel):
             if not nmat:
                 b.label(text="Load a material first", icon="INFO")
             else:
-                b.prop(sc, "glacier_active_material", text="")
-                active = sc.glacier_active_material
+                sb = sub(b, "Active Material", "MATERIAL")
+                sb.prop(sc, "glacier_active_material", text="")
                 mt_active = next((mt for mt in sc.glacier_materials
                                   if mt.key == active), None)
                 is_bp = bool(mt_active and mt_active.is_blueprint)
 
-                tbox = b.box()
-                trow = tbox.row(align=True)
-                trow.label(text="Textures", icon="TEXTURE")
+                tbox = sub(b, "Textures", "TEXTURE")
                 if not is_bp:
-                    trow.operator("glacier.fill_hashes", text="Fill Hashes",
+                    tbox.operator("glacier.fill_hashes", text="Fill Hashes",
                                   icon="FILE_REFRESH")
                 if is_bp:
                     tbox.label(text="Blueprint - load its .MATI to swap", icon="INFO")
@@ -5676,39 +7336,41 @@ class VIEW3D_PT_glacier_mesh_tools(bpy.types.Panel):
                     changed = (bool(ts.new_hash.strip())
                                and ts.new_hash.strip().upper() != ts.old_hash.upper()
                                ) or ts.tex_source != "HASH"
-                    sb = tbox.box()
-                    head = sb.row(align=True)
+                    sbx = tbox.box()
+                    head = sbx.row(align=True)
                     head.label(text=ts.slot_name,
                                icon="CHECKMARK" if changed else "DOT")
-                    sub = head.row(); sub.alignment = "RIGHT"
-                    sub.label(text=(ts.old_hash or "(none)")[:10])
+                    subr = head.row(); subr.alignment = "RIGHT"
+                    subr.label(text=(ts.old_hash or "(none)")[:10])
                     if is_bp:
                         continue
-                    sb.prop(ts, "tex_source", text="")
+                    sbx.prop(ts, "tex_source", text="")
                     eff = ts.new_hash.strip() or ts.old_hash
                     if ts.tex_source == "HASH":
-                        sb.prop(ts, "new_hash", text="Hash")
+                        sbx.prop(ts, "new_hash", text="Hash")
+                        hint(sbx, "16-hex hash of an existing in-game texture")
                     elif ts.tex_source == "IMAGE":
-                        sb.prop(ts, "image_path", text="Image")
-                        sb.prop(ts, "new_hash", text="New Hash")
-                        sb.prop(ts, "texd_hash", text=".TEXD hash")
+                        sbx.prop(ts, "image_path", text="Image")
+                        hint(sbx, "Your .png / .tga  (encoded on export)")
+                        sbx.prop(ts, "new_hash", text="New Hash")
+                        sbx.prop(ts, "texd_hash", text=".TEXD hash")
                     else:
-                        sb.prop(ts, "file_path", text=".TEXT")
-                        sb.prop(ts, "file_path_texd", text=".TEXD")
-                        sb.prop(ts, "new_hash", text="New Hash")
-                        sb.prop(ts, "texd_hash", text=".TEXD hash")
+                        sbx.prop(ts, "file_path", text=".TEXT")
+                        sbx.prop(ts, "file_path_texd", text=".TEXD")
+                        hint(sbx, ".TEXD optional - found by hash if blank")
+                        sbx.prop(ts, "new_hash", text="New Hash")
+                        sbx.prop(ts, "texd_hash", text=".TEXD hash")
                     if ts.tex_source != "HASH":
                         if eff:
                             td = ("  TEXD %s" % ts.texd_hash[:16]) if ts.texd_hash else ""
-                            sb.label(text="exports as %s%s" % (eff[:16], td),
-                                     icon="CHECKMARK")
+                            sbx.label(text="exports as %s%s" % (eff[:16], td),
+                                      icon="CHECKMARK")
                         else:
-                            sb.label(text="click Fill Hashes", icon="ERROR")
+                            sbx.label(text="click Fill Hashes", icon="ERROR")
                 if not any_tex:
                     tbox.label(text="(no textures)")
 
-                pbox = b.box()
-                pbox.label(text="Parameters", icon="MODIFIER")
+                pbox = sub(b, "Parameters", "MODIFIER")
                 any_p = False
                 for p in sc.glacier_params:
                     if p.mati_hash != active:
@@ -5722,68 +7384,1452 @@ class VIEW3D_PT_glacier_mesh_tools(bpy.types.Panel):
         # ============ SWAP WHOLE MATERIAL =================================
         b = section("glacier_show_swap", "Swap Whole Material", "UV_SYNC_SELECT")
         if b:
-            row = b.row()
+            sb = sub(b, "Material Overrides", "UV_SYNC_SELECT")
+            row = sb.row()
             row.template_list("GLACIER_UL_overrides", "", sc, "glacier_overrides",
                               sc, "glacier_overrides_index", rows=3)
             c2 = row.column(align=True)
             c2.operator("glacier.override_add", text="", icon="ADD")
             c2.operator("glacier.override_remove", text="", icon="REMOVE")
             if 0 <= sc.glacier_overrides_index < len(sc.glacier_overrides):
-                b.prop(sc.glacier_overrides[sc.glacier_overrides_index],
-                       "new_hash", text="New Hash")
+                sb.prop(sc.glacier_overrides[sc.glacier_overrides_index],
+                        "new_hash", text="New Hash")
 
         # ============ TEXTURE TOOLS =======================================
         b = section("glacier_show_conv", "Texture Tools", "IMAGE_DATA")
         if b:
-            box = b.box()
-            box.label(text="Folders", icon="FILE_FOLDER")
-            box.prop(sc, "glacier_work_dir", text="Work")
-            box.prop(sc, "glacier_tex_folder", text="Search")
+            sb = sub(b, "Folders", "FILE_FOLDER")
+            sb.prop(sc, "glacier_work_dir", text="Work")
+            hint(sb, "Output folder for decoded / re-encoded files")
+            sb.prop(sc, "glacier_tex_folder", text="Search")
+            hint(sb, "Folder of .TEXT / .TEXD to read from")
 
-            box = b.box()
-            box.label(text="Decode / Re-encode", icon="IMAGE_RGB")
-            row = box.row(align=True)
-            row.prop(sc, "glacier_decode_fmt", text="As")
-            box.operator("glacier.decode_model",
-                         text="Decode Textures", icon="IMPORT")
-            box.prop(sc, "glacier_bc_format", text="Encode")
-            box.operator("glacier.reencode",
-                         text="Re-encode Images", icon="EXPORT")
-            box.operator("glacier.generate_missing",
-                         text="Generate Missing .TEXT/.TEXD", icon="FILE_NEW")
-            box.prop(sc, "glacier_organize_textures")
+            sb = sub(b, "Decode To Images", "IMPORT")
+            hint(sb, "Reads .TEXT / .TEXD  ->  writes .png / .tga")
+            sb.prop(sc, "glacier_decode_fmt", text="Save As")
+            sb.operator("glacier.decode_model",
+                        text="Decode Textures", icon="IMPORT")
 
-            box = b.box()
-            box.label(text="Single texture", icon="FILE_IMAGE")
-            box.prop(sc, "glacier_decode_text", text=".TEXT")
-            box.prop(sc, "glacier_decode_texd", text=".TEXD")
-            box.operator("glacier.decode_texture", text="Decode to Image",
-                         icon="FILE_IMAGE")
-            row = box.row(align=True)
+            sb = sub(b, "Encode & Generate", "EXPORT")
+            hint(sb, "Reads your .png / .tga  ->  writes .TEXT / .TEXD")
+            sb.prop(sc, "glacier_bc_format", text="Encode")
+            sb.operator("glacier.reencode",
+                        text="Re-encode Images", icon="EXPORT")
+            sb.operator("glacier.generate_missing",
+                        text="Generate Missing .TEXT/.TEXD", icon="FILE_NEW")
+            sb.prop(sc, "glacier_organize_textures")
+
+            sb = sub(b, "Single Texture", "FILE_IMAGE")
+            hint(sb, "Decode one texture to an image")
+            sb.prop(sc, "glacier_decode_text", text=".TEXT")
+            sb.prop(sc, "glacier_decode_texd", text=".TEXD")
+            sb.operator("glacier.decode_texture", text="Decode to Image",
+                        icon="FILE_IMAGE")
+            row = sb.row(align=True)
             row.prop(sc, "glacier_inspect_tex", text="Inspect")
             row.operator("glacier.inspect_texture", text="", icon="VIEWZOOM")
+            hint(sb, "Inspect = read a .TEXT's size / format / mips")
+
+        # ============ RPKG CHUNK BROWSER ==================================
+        b = section("glacier_show_chunk", "RPKG Chunk Browser", "FILEBROWSER",
+                    "NEW")
+        if b:
+            sb = sub(b, "Mass-Import From A Chunk", "PACKAGE")
+            hint(sb, "Pull TEXT/TEXD straight out of a game chunk - no RPKG-Tool")
+            sb.prop(sc, "glacier_chunk_path", text="Chunk")
+            hint(sb, "Point at chunkNN.rpkg in the game's Runtime folder")
+            sb.prop(sc, "glacier_chunk_out", text="Extract To")
+            hint(sb, "Blank = your Work folder")
+            sb.operator("glacier.chunk_browser", text="Open Chunk Browser",
+                        icon="FILEBROWSER")
+            hint(sb, "Opens a window to filter, pick and bulk-extract")
 
         # ============ LEVEL OF DETAIL =====================================
         b = section("glacier_show_lod", "Level of Detail", "MOD_DECIM",
                     len(groups) or None)
         if b:
             if groups:
-                b.prop(sc, "glacier_lod_level", slider=True)
-                row = b.row(align=True)
+                sb = sub(b, "Show LOD", "MOD_DECIM")
+                sb.prop(sc, "glacier_lod_level", slider=True)
+                row = sb.row(align=True)
                 row.operator("glacier.lod_show_lod0")
                 row.operator("glacier.lod_show_all")
             else:
                 b.label(text="Import a model to use LOD tools", icon="INFO")
 
+        b = section("glacier_show_rig", "Control Rig", "ARMATURE_DATA", disabled=True)
+        if b:
+            b.prop(sc, "glacier_rig_target", text="Armature")
+            arm = _rig_active_armature(context)
+            if arm is None:
+                b.label(text="Select / set the imported armature", icon="INFO")
+            else:
+                rep = arm.get("glacier_rig_report", "")
+                if rep:
+                    col = b.column(align=True)
+                    col.scale_y = 0.8
+                    for chunk in [rep[i:i + 42] for i in range(0, len(rep), 42)]:
+                        col.label(text=chunk)
+            b.operator("glacier.rig_analyze", icon="VIEWZOOM")
+
+            sb = sub(b, "Clean Skeleton", "TRASH")
+            sb.prop(sc, "glacier_rig_clean_dryrun")
+            sb.operator("glacier.rig_clean", icon="BRUSH_DATA")
+
+            sb = sub(b, "Build Rig", "CON_KINEMATIC")
+            row = sb.row(align=True)
+            row.prop(sc, "glacier_rig_ik_arms", toggle=True)
+            row.prop(sc, "glacier_rig_ik_legs", toggle=True)
+            row = sb.row(align=True)
+            row.prop(sc, "glacier_rig_foot_roll", toggle=True)
+            row.prop(sc, "glacier_rig_twist", toggle=True)
+            sb.operator("glacier.rig_build", icon="ARMATURE_DATA")
+            sb.operator("glacier.rig_face", icon="MONKEY")
+            sb.operator("glacier.rig_remove", icon="X")
+
+        b = section("glacier_show_anim", "Animation (Preview)", "ARMATURE_DATA",
+                    disabled=True)
+        if b:
+            arm = _rig_active_armature(context)
+            if arm is None:
+                b.label(text="Set the target armature above", icon="INFO")
+            else:
+                rep = arm.get("glacier_anim_report", "")
+                if rep:
+                    col = b.column(align=True)
+                    col.scale_y = 0.8
+                    for chunk in [rep[i:i + 42] for i in range(0, len(rep), 42)]:
+                        col.label(text=chunk)
+            b.operator("import_scene.glacier2_anim", icon="IMPORT")
+            b.operator("glacier.anim_clear", icon="X")
+            b.label(text="Preview only - no export yet", icon="INFO")
+
+
+
+
+
+
+
+# =============================================================================
+# CONTROL RIG  -  Auto-Rig-Pro-style control rig generator for 007 skeletons
+# -----------------------------------------------------------------------------
+# Turns an imported .borg game skeleton (raw IOI deform bones) into a poseable
+# control rig, all inside the SAME armature:
+#   * DEF  - the original deform bones (keep the vertex weights, they FOLLOW the
+#            controls via Copy-Transforms - "the deform bones the rest follow")
+#   * CTRL - FK controllers for spine / neck / head / clavicles / limbs / fingers
+#   * MCH  - hidden machine bones that carry the IK solving for arms & legs
+#   * FACE - facial controllers (jaw, eye-aim, lids, brows, lips)
+# Plus optional skeleton CLEANUP that strips weightless helper/attacher/end
+# bones from the skeleton (and folds any stray weights into the parent).
+#
+# Detection is name-pattern driven and adaptive: it builds only the chains it
+# can find, using the First Light bone vocabulary (L_/R_ sides, spine_01..04,
+# neck_01, head, L_thumb_0.., ankle/heel/ball/toe, *_twist, weapon/attacher
+# helpers...) with generic fallbacks. The pure logic (rig_* functions) is
+# bpy-free and unit-tested; the bpy layer only builds bones/constraints/drivers.
+# =============================================================================
+
+RIG_DEF_COLL = "DEF"
+RIG_CTRL_COLL = "CTRL"
+RIG_MCH_COLL = "MCH"
+RIG_FACE_COLL = "FACE"
+RIG_ROOT_COLL = "Root"
+RIG_WIDGET_COLL = "RIG_Widgets"
+
+_RIG_HELPER_TOKENS = ("ground", "origin", "camera", "attacher", "weapon",
+                      "holster", "sheath", "magazine", "ammo", "equip", "militar",
+                      "helper", "prop_", "_prop", "ik_", "_ik", "pole", "marker",
+                      "cloth", "physics", "dyn_", "accessory")
+_RIG_TWIST_TOKENS = ("twist", "_rbf", "rbf_", "xtra", "roll", "bend_")
+_RIG_FACE_TOKENS = ("jaw", "eye", "lid", "brow", "lip", "mouth", "cheek", "nose",
+                    "tongue", "teeth", "chin", "forehead", "nostril", "sneer",
+                    "smile", "frown", "blink", "squint", "dimple", "pucker")
+_RIG_FINGERS = ("thumb", "index", "middle", "ring", "little", "pinky")
+
+
+def rig_side(name):
+    """Return 'L', 'R' or '' for a bone name (First Light uses L_/R_ prefixes)."""
+    n = name or ""
+    if n.startswith(("L_", "l_")):
+        return "L"
+    if n.startswith(("R_", "r_")):
+        return "R"
+    low = n.lower()
+    if low.endswith((".l", "_l", "-l")) or "_left" in low or low.startswith("left"):
+        return "L"
+    if low.endswith((".r", "_r", "-r")) or "_right" in low or low.startswith("right"):
+        return "R"
+    return ""
+
+
+def _rig_num_suffix(name):
+    """Trailing integer in a bone name (spine_04 -> 4), else -1."""
+    import re as _re
+    m = _re.search(r"(\d+)\s*$", name or "")
+    return int(m.group(1)) if m else -1
+
+
+def rig_classify_bone(name):
+    """Coarse role for a bone name. Returns one of: root, helper, twist, face,
+    finger, clavicle, upperarm, forearm, hand, thigh, shin, foot, ball, toe,
+    heel, pelvis, spine, neck, head, other."""
+    low = (name or "").lower()
+    if not low:
+        return "other"
+    if low in ("root", "origin", "ground", "cog", "master"):
+        return "root"
+    if low.endswith(("_end", "_tip", "_nub", "_marker")):
+        return "helper"
+    if any(t in low for t in _RIG_TWIST_TOKENS):
+        return "twist"
+    if any(t in low for t in _RIG_HELPER_TOKENS):
+        return "helper"
+    if low.endswith("_root"):
+        return "root"
+    if any(t in low for t in _RIG_FINGERS):
+        return "finger"
+    if "clavicle" in low or "collar" in low or "shoulder" in low:
+        return "clavicle"
+    if "upperarm" in low or ("arm" in low and "upper" in low) or "humerus" in low:
+        return "upperarm"
+    if "forearm" in low or "lowerarm" in low or "forearm" in low or "ulna" in low:
+        return "forearm"
+    if "hand" in low or "wrist" in low or "palm" in low:
+        return "hand"
+    if "thigh" in low or "upperleg" in low or "upleg" in low or "femur" in low:
+        return "thigh"
+    if "calf" in low or "shin" in low or "lowerleg" in low or "tibia" in low or "knee" in low:
+        return "shin"
+    if "heel" in low:
+        return "heel"
+    if "ball" in low:
+        return "ball"
+    if "toe" in low:
+        return "toe"
+    if "foot" in low or "ankle" in low:
+        return "foot"
+    if any(t in low for t in _RIG_FACE_TOKENS):
+        return "face"
+    if "pelvis" in low or low == "hips" or low == "hip" or "cog" in low:
+        return "pelvis"
+    if "spine" in low or "chest" in low or "abdomen" in low or "waist" in low:
+        return "spine"
+    if "neck" in low:
+        return "neck"
+    if low == "head" or low.endswith("_head") or low.endswith("head"):
+        return "head"
+    return "other"
+
+
+def _rig_sorted_chain(names):
+    """Sort a set of bone names by their trailing number (then alphabetically)."""
+    return sorted(names, key=lambda n: (_rig_num_suffix(n), n))
+
+
+def rig_detect_chains(names):
+    """Group a flat list of bone names into rig chains. Returns a dict describing
+    spine, neck, head, root, per-side arms/legs/fingers, twist/face/helper sets."""
+    cls = {n: rig_classify_bone(n) for n in names}
+    out = {
+        "root": None,
+        "spine": [],
+        "neck": [],
+        "head": None,
+        "arms": {"L": {}, "R": {}},
+        "legs": {"L": {}, "R": {}},
+        "fingers": {"L": {}, "R": {}},
+        "twist": [],
+        "face": [],
+        "helper": [],
+        "classes": cls,
+    }
+    roots = [n for n in names if cls[n] == "root"]
+    out["root"] = roots[0] if roots else None
+    out["spine"] = _rig_sorted_chain([n for n in names if cls[n] in ("pelvis", "spine")])
+    out["neck"] = _rig_sorted_chain([n for n in names if cls[n] == "neck"])
+    heads = [n for n in names if cls[n] == "head"]
+    out["head"] = heads[0] if heads else None
+    out["twist"] = sorted(n for n in names if cls[n] == "twist")
+    out["face"] = sorted(n for n in names if cls[n] == "face")
+    out["helper"] = sorted(n for n in names if cls[n] == "helper")
+
+    for n in names:
+        c = cls[n]
+        side = rig_side(n)
+        if c in ("clavicle", "upperarm", "forearm", "hand") and side in ("L", "R"):
+            out["arms"][side][c] = n
+        elif c in ("thigh", "shin", "foot", "ball", "toe", "heel") and side in ("L", "R"):
+            out["legs"][side].setdefault(c, n)
+        elif c == "finger" and side in ("L", "R"):
+            fam = next((f for f in _RIG_FINGERS if f in n.lower()), "")
+            if fam:
+                out["fingers"][side].setdefault(fam, []).append(n)
+    for side in ("L", "R"):
+        for fam, bones in out["fingers"][side].items():
+            out["fingers"][side][fam] = _rig_sorted_chain(bones)
+    return out
+
+
+def rig_clean_plan(names, parent_of, weighted, protect=None):
+    """Decide which bones to strip when cleaning the skeleton.
+    `parent_of`  : {bone: parent_bone or None}
+    `weighted`   : set of bone names that actually carry vertex weight.
+    `protect`    : extra bone names that must never be removed.
+    A bone is removed when it carries no weight, none of its descendants carry
+    weight, and it is a helper/attacher or a weightless leaf. Weighted bones, the
+    deform chain, ALL facial bones, and anything under the head are always kept
+    (facial detail bones are often weightless but must be preserved for the face
+    rig). Returns {'remove': [...], 'keep': [...], 'reparent': {child: parent}}."""
+    protect = set(protect or ())
+    children = {n: [] for n in names}
+    for n in names:
+        p = parent_of.get(n)
+        if p in children:
+            children[p].append(n)
+    cls = {n: rig_classify_bone(n) for n in names}
+
+    # find the head bone and everything parented under it -> protect the face
+    # detail bones (often weightless) but still allow helper/attacher cleanup.
+    head = next((n for n in names if cls[n] == "head"), None)
+    if head:
+        stack = [head]
+        while stack:
+            cur = stack.pop()
+            if cls.get(cur) != "helper":
+                protect.add(cur)
+            stack.extend(children.get(cur, ()))
+
+    # bones that have a weighted bone anywhere below them (or are weighted)
+    carries = {}
+
+    def carries_weight(n):
+        if n in carries:
+            return carries[n]
+        val = n in weighted or any(carries_weight(c) for c in children[n])
+        carries[n] = val
+        return val
+    for n in names:
+        carries_weight(n)
+
+    remove = []
+    for n in names:
+        if n in weighted or n in protect:
+            continue
+        if carries.get(n):           # keep: something below it deforms
+            continue
+        # never strip the rig root, a structural bone, or any facial bone
+        if cls[n] in ("root", "spine", "neck", "head", "pelvis", "face"):
+            continue
+        is_leaf = not children[n]
+        # helpers/attachers anywhere, plus any weightless leaf (pivots, *_end,
+        # weapon points, ik markers), are surplus on a deform skeleton.
+        if cls[n] == "helper" or is_leaf:
+            remove.append(n)
+    remove_set = set(remove)
+    reparent = {}
+    for n in names:
+        if n in remove_set:
+            continue
+        p = parent_of.get(n)
+        while p in remove_set:        # skip removed ancestors
+            p = parent_of.get(p)
+        if p != parent_of.get(n):
+            reparent[n] = p
+    keep = [n for n in names if n not in remove_set]
+    return {"remove": sorted(remove_set), "keep": keep, "reparent": reparent}
+
+
+def rig_control_plan(chains, opts):
+    """Build a build-plan from detected chains. Produces:
+      controls   : [{name, source, parent, coll, color, widget, size}]  edit-bones
+      copy       : [{def_bone, ctrl, name}]   DEF follows CTRL (copy transforms)
+      ik         : [{mch_chain:[...], target, pole, def_bones:[...], switch, side, kind}]
+      twist      : [{bone, follow}]
+      props      : [{bone, name, value, min, max}]
+    `source` is the deform bone a control is cloned from (head/tail/roll)."""
+    controls = []
+    copy = []
+    ik = []
+    twist = []
+    props = []
+
+    root_src = chains["root"]
+    root_ctrl = "CTRL-root"
+    controls.append({"name": root_ctrl, "source": root_src, "parent": None,
+                     "coll": RIG_ROOT_COLL, "color": "THEME09", "widget": "circle",
+                     "size": 2.5})
+
+    # ---- spine / neck / head FK -------------------------------------------
+    prev = root_ctrl
+    spine_ctrls = []
+    for b in chains["spine"]:
+        c = "CTRL-%s" % b
+        controls.append({"name": c, "source": b, "parent": prev,
+                         "coll": RIG_CTRL_COLL, "color": "THEME03", "widget": "cube",
+                         "size": 1.4})
+        copy.append({"def_bone": b, "ctrl": c, "name": "RIG-fk"})
+        spine_ctrls.append(c)
+        prev = c
+    chain_top = spine_ctrls[-1] if spine_ctrls else root_ctrl
+    prev = chain_top
+    for b in chains["neck"]:
+        c = "CTRL-%s" % b
+        controls.append({"name": c, "source": b, "parent": prev,
+                         "coll": RIG_CTRL_COLL, "color": "THEME03", "widget": "cube",
+                         "size": 1.2})
+        copy.append({"def_bone": b, "ctrl": c, "name": "RIG-fk"})
+        prev = c
+    if chains["head"]:
+        c = "CTRL-%s" % chains["head"]
+        controls.append({"name": c, "source": chains["head"], "parent": prev,
+                         "coll": RIG_CTRL_COLL, "color": "THEME03", "widget": "circle",
+                         "size": 1.6})
+        copy.append({"def_bone": chains["head"], "ctrl": c, "name": "RIG-fk"})
+
+    # ---- arms --------------------------------------------------------------
+    for side in ("L", "R"):
+        arm = chains["arms"][side]
+        clav, up, fore, hand = (arm.get("clavicle"), arm.get("upperarm"),
+                                arm.get("forearm"), arm.get("hand"))
+        parent = chain_top
+        if clav:
+            c = "CTRL-%s" % clav
+            controls.append({"name": c, "source": clav, "parent": chain_top,
+                             "coll": RIG_CTRL_COLL, "color": "THEME04", "widget": "circle",
+                             "size": 1.0})
+            copy.append({"def_bone": clav, "ctrl": c, "name": "RIG-fk"})
+            parent = c
+        fk_prev = parent
+        for b in (up, fore, hand):
+            if not b:
+                continue
+            c = "CTRL-%s" % b
+            controls.append({"name": c, "source": b, "parent": fk_prev,
+                             "coll": RIG_CTRL_COLL, "color": "THEME04", "widget": "circle",
+                             "size": 1.1})
+            copy.append({"def_bone": b, "ctrl": c, "name": "RIG-fk"})
+            fk_prev = c
+        if opts.get("ik_arms", True) and up and fore and hand:
+            tgt = "CTRL-ik_hand.%s" % side
+            pole = "CTRL-pole_arm.%s" % side
+            controls.append({"name": tgt, "source": hand, "parent": root_ctrl,
+                             "coll": RIG_CTRL_COLL, "color": "THEME01", "widget": "cube",
+                             "size": 1.3})
+            controls.append({"name": pole, "source": fore, "parent": root_ctrl,
+                             "coll": RIG_CTRL_COLL, "color": "THEME01", "widget": "sphere",
+                             "size": 0.5, "pole_for": (up, fore, hand)})
+            mch = ["MCH-ik_%s" % up, "MCH-ik_%s" % fore]
+            controls.append({"name": mch[0], "source": up, "parent": parent,
+                             "coll": RIG_MCH_COLL, "color": "THEME08", "widget": None,
+                             "size": 1.0, "deform": False})
+            controls.append({"name": mch[1], "source": fore, "parent": mch[0],
+                             "coll": RIG_MCH_COLL, "color": "THEME08", "widget": None,
+                             "size": 1.0, "deform": False})
+            props.append({"bone": tgt, "name": "ik_fk", "value": 0.0, "min": 0.0, "max": 1.0})
+            ik.append({"mch_chain": mch, "target": tgt, "pole": pole,
+                       "def_bones": [up, fore], "fk_ctrls": ["CTRL-%s" % up, "CTRL-%s" % fore],
+                       "hand": hand, "hand_ctrl": "CTRL-%s" % hand,
+                       "switch": tgt, "side": side, "kind": "arm"})
+
+    # ---- legs --------------------------------------------------------------
+    for side in ("L", "R"):
+        leg = chains["legs"][side]
+        thigh, shin, foot = leg.get("thigh"), leg.get("shin"), leg.get("foot")
+        ball, toe = leg.get("ball"), leg.get("toe")
+        fk_prev = root_ctrl
+        for b in (thigh, shin, foot, ball, toe):
+            if not b:
+                continue
+            c = "CTRL-%s" % b
+            controls.append({"name": c, "source": b, "parent": fk_prev,
+                             "coll": RIG_CTRL_COLL, "color": "THEME04", "widget": "circle",
+                             "size": 1.1})
+            copy.append({"def_bone": b, "ctrl": c, "name": "RIG-fk"})
+            fk_prev = c
+        if opts.get("ik_legs", True) and thigh and shin and foot:
+            tgt = "CTRL-ik_foot.%s" % side
+            pole = "CTRL-pole_leg.%s" % side
+            controls.append({"name": tgt, "source": foot, "parent": root_ctrl,
+                             "coll": RIG_CTRL_COLL, "color": "THEME01", "widget": "cube",
+                             "size": 1.4})
+            controls.append({"name": pole, "source": shin, "parent": root_ctrl,
+                             "coll": RIG_CTRL_COLL, "color": "THEME01", "widget": "sphere",
+                             "size": 0.5, "pole_for": (thigh, shin, foot)})
+            mch = ["MCH-ik_%s" % thigh, "MCH-ik_%s" % shin]
+            controls.append({"name": mch[0], "source": thigh, "parent": root_ctrl,
+                             "coll": RIG_MCH_COLL, "color": "THEME08", "widget": None,
+                             "size": 1.0, "deform": False})
+            controls.append({"name": mch[1], "source": shin, "parent": mch[0],
+                             "coll": RIG_MCH_COLL, "color": "THEME08", "widget": None,
+                             "size": 1.0, "deform": False})
+            props.append({"bone": tgt, "name": "ik_fk", "value": 0.0, "min": 0.0, "max": 1.0})
+            ik.append({"mch_chain": mch, "target": tgt, "pole": pole,
+                       "def_bones": [thigh, shin], "fk_ctrls": ["CTRL-%s" % thigh, "CTRL-%s" % shin],
+                       "hand": foot, "hand_ctrl": "CTRL-%s" % foot,
+                       "switch": tgt, "side": side, "kind": "leg"})
+            if opts.get("foot_roll", True) and (ball or toe):
+                roll = "CTRL-foot_roll.%s" % side
+                controls.append({"name": roll, "source": foot, "parent": tgt,
+                                 "coll": RIG_CTRL_COLL, "color": "THEME01",
+                                 "widget": "arrow", "size": 1.0})
+                props.append({"bone": roll, "name": "roll", "value": 0.0,
+                              "min": -90.0, "max": 90.0})
+
+    # ---- fingers (FK curl chain) ------------------------------------------
+    for side in ("L", "R"):
+        hand_ctrl = "CTRL-%s" % chains["arms"][side].get("hand", "") if chains["arms"][side].get("hand") else root_ctrl
+        for fam, bones in chains["fingers"][side].items():
+            prev = hand_ctrl
+            for b in bones:
+                c = "CTRL-%s" % b
+                controls.append({"name": c, "source": b, "parent": prev,
+                                 "coll": RIG_CTRL_COLL, "color": "THEME11",
+                                 "widget": "circle", "size": 0.6})
+                copy.append({"def_bone": b, "ctrl": c, "name": "RIG-fk"})
+                prev = c
+
+    # ---- twist bones follow their parent deform ---------------------------
+    if opts.get("twist_follow", True):
+        for b in chains["twist"]:
+            twist.append({"bone": b})
+
+    return {"controls": controls, "copy": copy, "ik": ik, "twist": twist, "props": props}
+
+
+def rig_face_regions(face_bones):
+    """Group facial bones into a small set of meaningful regions so the face rig
+    has ONE controller per region (top lip, bottom lip, jaw, each brow, each
+    eyelid, each cheek...) rather than a controller per individual bone."""
+    regions = {}
+    for b in face_bones:
+        low = b.lower()
+        side = rig_side(b) or "C"
+        if ("eye" in low and "lid" not in low and "brow" not in low
+                and "lash" not in low):
+            continue                                  # eyes -> aim target, below
+        if "jaw" in low or "chin" in low:
+            key = "jaw"
+        elif "lip" in low or "mouth" in low:
+            if "corner" in low or "cnr" in low:
+                key = "lip_corner_%s" % side
+            elif any(t in low for t in ("upper", "_up", "top")):
+                key = "lip_upper"
+            elif any(t in low for t in ("lower", "_low", "bottom", "_bot")):
+                key = "lip_lower"
+            else:
+                key = "mouth_%s" % side
+        elif "brow" in low:
+            key = "brow_%s" % side
+        elif "lid" in low or "eyelid" in low or "lash" in low:
+            if any(t in low for t in ("lower", "_low", "bottom", "_bot")):
+                key = "lid_lower_%s" % side
+            else:
+                key = "lid_upper_%s" % side
+        elif "cheek" in low:
+            key = "cheek_%s" % side
+        elif "nose" in low or "nostril" in low:
+            key = "nose"
+        else:
+            key = "face_%s" % side
+        regions.setdefault(key, []).append(b)
+    return regions
+
+
+def rig_face_plan(chains, head_bone):
+    """Plan a clean, ARP-style facial rig: an eye-aim target the eyes track, a
+    visible jaw control, and ONE controller per face region driving every bone in
+    that region (so e.g. a single control moves the whole top lip)."""
+    face = chains["face"]
+    controls = []
+    copy = []
+    aim = []
+    jaw = None
+    eyes = [b for b in face if "eye" in b.lower() and "lid" not in b.lower()
+            and "brow" not in b.lower() and "lash" not in b.lower()]
+    if eyes and head_bone:
+        master = "CTRL-eyes_target"
+        controls.append({"name": master, "source": head_bone, "parent": head_bone,
+                         "coll": RIG_FACE_COLL, "color": "THEME01", "widget": "circle",
+                         "size": 2.0, "offset_forward": True})
+        for e in eyes:
+            side = rig_side(e) or "C"
+            t = "CTRL-eye_target.%s" % side
+            controls.append({"name": t, "source": e, "parent": master,
+                             "coll": RIG_FACE_COLL, "color": "THEME01", "widget": "circle",
+                             "size": 0.6, "offset_forward": True})
+            aim.append({"eye": e, "target": t})
+
+    regions = rig_face_regions(face)
+    for key, bones in sorted(regions.items()):
+        ctrl = "CTRL-face_%s" % key
+        if key == "jaw":
+            jaw = bones[0]
+            controls.append({"name": ctrl, "from_bones": list(bones), "parent": head_bone,
+                             "coll": RIG_FACE_COLL, "color": "THEME06", "widget": "wedge",
+                             "size": 1.6})
+        else:
+            controls.append({"name": ctrl, "from_bones": list(bones), "parent": head_bone,
+                             "coll": RIG_FACE_COLL, "color": "THEME06", "widget": "sphere",
+                             "size": 0.5})
+        for b in bones:
+            copy.append({"def_bone": b, "ctrl": ctrl, "name": "RIG-face"})
+    return {"controls": controls, "copy": copy, "aim": aim, "jaw": jaw,
+            "eyes": eyes, "regions": sorted(regions.keys())}
+
+
+# ----- bpy construction layer ----------------------------------------------
+def _rig_collection(arm, name):
+    coll = arm.collections.get(name) if hasattr(arm.collections, "get") else None
+    if coll is None:
+        try:
+            coll = arm.collections.get(name)
+        except Exception:
+            coll = None
+    if coll is None:
+        coll = arm.collections.new(name)
+    return coll
+
+
+def _rig_widget_object(name, kind):
+    """Create (or reuse) a simple custom-shape mesh for control bones."""
+    obj = bpy.data.objects.get(name)
+    if obj is not None:
+        return obj
+    import math as _m
+    verts, edges = [], []
+    if kind == "circle":
+        n = 16
+        for i in range(n):
+            a = 2 * _m.pi * i / n
+            verts.append((_m.cos(a), 0.0, _m.sin(a)))
+        edges = [(i, (i + 1) % n) for i in range(n)]
+    elif kind == "cube":
+        s = 0.5
+        verts = [(x * s, y * s, z * s) for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
+        edges = [(0, 1), (0, 2), (0, 4), (3, 1), (3, 2), (3, 7), (5, 1), (5, 4),
+                 (5, 7), (6, 2), (6, 4), (6, 7)]
+    elif kind == "sphere":
+        n = 12
+        for plane in range(3):
+            for i in range(n):
+                a = 2 * _m.pi * i / n
+                c, s = _m.cos(a), _m.sin(a)
+                verts.append((c, s, 0) if plane == 0 else (c, 0, s) if plane == 1 else (0, c, s))
+        edges = []
+        for p in range(3):
+            base = p * n
+            edges += [(base + i, base + (i + 1) % n) for i in range(n)]
+    elif kind == "arrow":
+        verts = [(0, 0, 0), (0, 1, 0), (-0.2, 0.8, 0), (0.2, 0.8, 0)]
+        edges = [(0, 1), (1, 2), (1, 3)]
+    elif kind == "wedge":
+        # a chunky open V / jaw shape that reads clearly in the viewport
+        verts = [(-0.7, 0.0, 0.3), (0.7, 0.0, 0.3), (0.5, -0.6, -0.2),
+                 (-0.5, -0.6, -0.2), (0.0, -0.9, -0.1)]
+        edges = [(0, 1), (1, 2), (2, 4), (4, 3), (3, 0), (2, 3)]
+    else:
+        verts = [(0, 0, 0), (0, 1, 0)]
+        edges = [(0, 1)]
+    me = bpy.data.meshes.new(name)
+    me.from_pydata(verts, edges, [])
+    me.update()
+    obj = bpy.data.objects.new(name, me)
+    coll = bpy.data.collections.get(RIG_WIDGET_COLL)
+    if coll is None:
+        coll = bpy.data.collections.new(RIG_WIDGET_COLL)
+        try:
+            bpy.context.scene.collection.children.link(coll)
+            coll.hide_viewport = True
+            coll.hide_render = True
+        except Exception:
+            pass
+    coll.objects.link(obj)
+    return obj
+
+
+def _rig_make_controls(arm_obj, specs):
+    """Create the controller edit-bones described by `specs` and parent them.
+    Pole targets are placed out along the limb's natural bend direction so the
+    IK solve matches the model instead of snapping."""
+    from mathutils import Vector
+    arm = arm_obj.data
+    bpy.ops.object.mode_set(mode="EDIT")
+    ebs = arm.edit_bones
+    made = {}
+    for sp in specs:
+        if sp["name"] in ebs:
+            eb = ebs[sp["name"]]
+        else:
+            eb = ebs.new(sp["name"])
+        src = ebs.get(sp["source"]) if sp.get("source") else None
+        if sp.get("from_bones"):
+            # region face control: sit at the average head of its member bones,
+            # with a short tail facing forward, so one controller covers the group
+            mem = [ebs.get(n) for n in sp["from_bones"] if ebs.get(n) is not None]
+            if mem:
+                avg = Vector((0.0, 0.0, 0.0))
+                for m in mem:
+                    avg = avg + m.head
+                avg = avg * (1.0 / len(mem))
+                span = max((m.tail - m.head).length for m in mem) or 0.04
+                eb.head = avg
+                eb.tail = avg + Vector((0.0, -1.0, 0.0)) * (span * 1.2 + 0.02)
+                eb.roll = 0.0
+            else:
+                eb.head = Vector((0, 0, 0)); eb.tail = Vector((0, 0, 1))
+        elif sp.get("pole_for"):
+            # place the pole in the bend plane, out in front of the joint
+            a, b, c = sp["pole_for"]
+            ea, eb2, ec = ebs.get(a), ebs.get(b), ebs.get(c)
+            if ea and eb2 and ec:
+                root_h, mid_h, end_h = ea.head, eb2.head, ec.head
+                chord = (root_h + end_h) * 0.5
+                bend = (mid_h - chord)
+                limb = (end_h - root_h).length or 1.0
+                if bend.length < 1e-4:
+                    bend = Vector((0, -1, 0))
+                bend = bend.normalized()
+                eb.head = mid_h + bend * limb * 0.5
+                eb.tail = eb.head + bend * (limb * 0.12 + 0.02)
+                eb.roll = 0.0
+            elif src is not None:
+                eb.head = src.head.copy(); eb.tail = src.tail.copy()
+        elif src is not None:
+            eb.head = src.head.copy()
+            eb.tail = src.tail.copy()
+            eb.roll = src.roll
+            size = sp.get("size", 1.0)
+            if size != 1.0:
+                d = (eb.tail - eb.head)
+                eb.tail = eb.head + d * size
+            if sp.get("offset_forward"):
+                fwd = Vector((0, -1, 0)) * max(0.1, (src.tail - src.head).length) * 4
+                eb.head = src.head + fwd
+                eb.tail = eb.head + Vector((0, 0, (src.tail - src.head).length))
+        else:
+            eb.head = Vector((0, 0, 0))
+            eb.tail = Vector((0, 0, 1))
+        eb.use_connect = False
+        made[sp["name"]] = sp
+    for sp in specs:                          # parenting after all exist
+        if sp.get("parent") and sp["parent"] in ebs and sp["name"] in ebs:
+            ebs[sp["name"]].parent = ebs[sp["parent"]]
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+    # collections, colors, widgets, deform flag
+    for sp in specs:
+        bone = arm.bones.get(sp["name"])
+        if bone is None:
+            continue
+        bone.use_deform = bool(sp.get("deform", False))
+        coll = _rig_collection(arm, sp["coll"])
+        try:
+            coll.assign(bone)
+        except Exception:
+            pass
+        try:
+            bone.color.palette = sp.get("color", "DEFAULT")
+        except Exception:
+            pass
+        pb = arm_obj.pose.bones.get(sp["name"])
+        if pb is not None and sp.get("widget"):
+            try:
+                pb.custom_shape = _rig_widget_object("WGT-" + sp["widget"], sp["widget"])
+                # custom shapes scale with bone length by default, so the widget
+                # is always proportional to the model; `size` fine-tunes it.
+                pb.custom_shape_scale_xyz = (sp.get("size", 1.0),) * 3
+                try:
+                    pb.use_custom_shape_bone_size = True
+                except Exception:
+                    pass
+                pb.color.palette = sp.get("color", "DEFAULT")
+            except Exception:
+                pass
+    return made
+
+
+def _rig_add_prop(arm_obj, bone, name, value, lo, hi):
+    pb = arm_obj.pose.bones.get(bone)
+    if pb is None:
+        return
+    pb[name] = float(value)
+    try:
+        ui = pb.id_properties_ui(name)
+        ui.update(min=float(lo), max=float(hi), soft_min=float(lo), soft_max=float(hi))
+    except Exception:
+        pass
+
+
+def _rig_copy_constraint(arm_obj, def_bone, ctrl, name, ctype="COPY_TRANSFORMS",
+                         space="LOCAL"):
+    pb = arm_obj.pose.bones.get(def_bone)
+    if pb is None or ctrl not in arm_obj.pose.bones:
+        return None
+    con = pb.constraints.new(ctype)
+    con.name = name
+    con.target = arm_obj
+    con.subtarget = ctrl
+    # LOCAL->LOCAL copy is immune to any rest-pose orientation mismatch between
+    # the control and the deform bone: at rest the control's local transform is
+    # identity, so the deform bone is untouched (no "noodle"/melt). Only when you
+    # actually pose the control does the deform bone follow.
+    if space == "LOCAL":
+        try:
+            con.target_space = "LOCAL"
+            con.owner_space = "LOCAL"
+        except Exception:
+            pass
+    return con
+
+
+def _rig_driver_influence(arm_obj, bone, con_name, prop_bone, prop_name, invert):
+    """Drive a constraint's influence from a custom property (IK/FK switch)."""
+    path = 'pose.bones["%s"].constraints["%s"].influence' % (bone, con_name)
+    try:
+        fc = arm_obj.driver_add(path)
+    except Exception:
+        return
+    drv = fc.driver
+    drv.type = "SCRIPTED"
+    for v in list(drv.variables):
+        drv.variables.remove(v)
+    var = drv.variables.new()
+    var.name = "sw"
+    var.type = "SINGLE_PROP"
+    tgt = var.targets[0]
+    tgt.id = arm_obj
+    tgt.data_path = 'pose.bones["%s"]["%s"]' % (prop_bone, prop_name)
+    drv.expression = "1.0 - sw" if invert else "sw"
+
+
+def _rig_apply_relations(arm_obj, plan):
+    """Add all constraints + drivers for the body control plan."""
+    for c in plan["copy"]:
+        _rig_copy_constraint(arm_obj, c["def_bone"], c["ctrl"], c["name"])
+
+    for sw in plan["props"]:
+        _rig_add_prop(arm_obj, sw["bone"], sw["name"], sw["value"], sw["min"], sw["max"])
+
+    for ik in plan["ik"]:
+        mch = ik["mch_chain"]
+        # MCH chain copies the FK controls, last MCH gets the IK constraint
+        last = arm_obj.pose.bones.get(mch[-1])
+        if last is not None and ik["target"] in arm_obj.pose.bones:
+            con = last.constraints.new("IK")
+            con.name = "RIG-ik"
+            con.target = arm_obj
+            con.subtarget = ik["target"]
+            con.chain_count = len(mch)
+            if ik["pole"] in arm_obj.pose.bones:
+                con.pole_target = arm_obj
+                con.pole_subtarget = ik["pole"]
+                con.pole_angle = -1.5708 if ik["kind"] == "leg" else 1.5708
+        # blend each DEF bone between its FK control and the matching MCH-IK bone
+        for def_bone, mch_bone in zip(ik["def_bones"], mch):
+            con = _rig_copy_constraint(arm_obj, def_bone, mch_bone, "RIG-ik")
+            if con is not None:
+                _rig_driver_influence(arm_obj, def_bone, "RIG-ik",
+                                      ik["switch"], "ik_fk", invert=False)
+        # the hand/foot DEF follows the IK target directly when in IK. This one
+        # is WORLD space so the hand matches the target's orientation.
+        if ik.get("hand"):
+            con = _rig_copy_constraint(arm_obj, ik["hand"], ik["target"], "RIG-ik",
+                                       space="WORLD")
+            if con is not None:
+                _rig_driver_influence(arm_obj, ik["hand"], "RIG-ik",
+                                      ik["switch"], "ik_fk", invert=False)
+
+    for tw in plan["twist"]:
+        pb = arm_obj.pose.bones.get(tw["bone"])
+        if pb is None or pb.parent is None:
+            continue
+        con = pb.constraints.new("COPY_ROTATION")
+        con.name = "RIG-twist"
+        con.target = arm_obj
+        con.subtarget = pb.parent.name
+        con.use_x = False
+        con.use_z = False
+        con.influence = 0.5
+        con.mix_mode = "ADD"
+        # LOCAL spaces so the twist bone only follows its parent's *local* roll;
+        # copying world rotation here is what melted the arms.
+        try:
+            con.target_space = "LOCAL"
+            con.owner_space = "LOCAL"
+        except Exception:
+            pass
+
+
+def _rig_apply_face(arm_obj, plan):
+    for c in plan["copy"]:
+        _rig_copy_constraint(arm_obj, c["def_bone"], c["ctrl"], c["name"])
+    for a in plan["aim"]:
+        pb = arm_obj.pose.bones.get(a["eye"])
+        if pb is None or a["target"] not in arm_obj.pose.bones:
+            continue
+        con = pb.constraints.new("DAMPED_TRACK")
+        con.name = "RIG-eye-aim"
+        con.target = arm_obj
+        con.subtarget = a["target"]
+        con.track_axis = "TRACK_Y"
+
+
+def _rig_weighted_bones(arm_obj):
+    """Bones that actually carry weight on any mesh skinned to this armature."""
+    weighted = set()
+    for ob in bpy.data.objects:
+        if ob.type != "MESH":
+            continue
+        if not any(m.type == "ARMATURE" and m.object == arm_obj for m in ob.modifiers):
+            continue
+        names = {vg.index: vg.name for vg in ob.vertex_groups}
+        present = set()
+        for v in ob.data.vertices:
+            for g in v.groups:
+                if g.weight > 0.0001:
+                    present.add(g.group)
+        for gi in present:
+            if gi in names:
+                weighted.add(names[gi])
+    return weighted
+
+
+def _rig_skinned_meshes(arm_obj):
+    out = []
+    for ob in bpy.data.objects:
+        if ob.type == "MESH" and any(
+                m.type == "ARMATURE" and m.object == arm_obj for m in ob.modifiers):
+            out.append(ob)
+    return out
+
+
+def _rig_transfer_group(ob, src_name, dst_name):
+    """Fold vertex-group `src_name`'s weights into `dst_name`, then delete src."""
+    src = ob.vertex_groups.get(src_name)
+    if src is None:
+        return
+    dst = ob.vertex_groups.get(dst_name)
+    if dst is None and dst_name:
+        dst = ob.vertex_groups.new(name=dst_name)
+    si = src.index
+    if dst is not None:
+        for v in ob.data.vertices:
+            for g in v.groups:
+                if g.group == si and g.weight > 0.0:
+                    dst.add([v.index], g.weight, "ADD")
+    ob.vertex_groups.remove(src)
+
+
+def _rig_survivor_parent(arm, name, remove_set):
+    """Nearest ancestor of `name` that is NOT being removed (or None)."""
+    b = arm.bones.get(name)
+    p = b.parent if b else None
+    while p is not None and p.name in remove_set:
+        p = p.parent
+    return p.name if p is not None else None
+
+
+def _rig_clean_apply(arm_obj, plan):
+    """Delete the planned bones. Any weight a removed bone carries is first folded
+    into its nearest surviving parent so the mesh keeps deforming - "redo weights
+    on skeleton change" - instead of silently losing influence."""
+    arm = arm_obj.data
+    remove_set = set(plan["remove"])
+    for ob in _rig_skinned_meshes(arm_obj):
+        for rem in plan["remove"]:
+            survivor = _rig_survivor_parent(arm, rem, remove_set)
+            _rig_transfer_group(ob, rem, survivor)
+    bpy.ops.object.mode_set(mode="OBJECT")
+    bpy.context.view_layer.objects.active = arm_obj
+    bpy.ops.object.mode_set(mode="EDIT")
+    ebs = arm.edit_bones
+    for child, new_parent in plan["reparent"].items():
+        if child in ebs:
+            ebs[child].parent = ebs.get(new_parent) if new_parent else None
+    for rem in plan["remove"]:
+        if rem in ebs:
+            ebs.remove(ebs[rem])
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+
+def _rig_organize_collections(arm_obj):
+    """Put every controlled (deform) bone in the DEF collection and hide it, hide
+    the MCH machine bones, and keep CTRL / FACE / Root visible. This is what lets
+    you hide the skeleton and pose with just the controllers."""
+    arm = arm_obj.data
+    defc = _rig_collection(arm, RIG_DEF_COLL)
+    for b in arm.bones:
+        if b.name.startswith(("CTRL-", "MCH-")):
+            continue
+        try:
+            defc.assign(b)
+        except Exception:
+            pass
+    vis = {RIG_DEF_COLL: False, RIG_MCH_COLL: False, RIG_WIDGET_COLL: False,
+           RIG_CTRL_COLL: True, RIG_FACE_COLL: True, RIG_ROOT_COLL: True}
+    for name, visible in vis.items():
+        coll = arm.collections.get(name) if hasattr(arm.collections, "get") else None
+        if coll is not None:
+            try:
+                coll.is_visible = visible
+            except Exception:
+                pass
+
+
+def _rig_active_armature(context):
+    sc = context.scene
+    arm = getattr(sc, "glacier_rig_target", None)
+    if arm is not None and arm.type == "ARMATURE":
+        return arm
+    ob = context.active_object
+    if ob is not None and ob.type == "ARMATURE":
+        return ob
+    if ob is not None and ob.parent is not None and ob.parent.type == "ARMATURE":
+        return ob.parent
+    return None
+
+
+class GLACIER_OT_rig_analyze(bpy.types.Operator):
+    bl_idname = "glacier.rig_analyze"
+    bl_label = "Analyze Skeleton"
+    bl_description = ("Scan the selected armature and report the chains it found "
+                      "(spine, arms, legs, fingers, face) plus weightless bones "
+                      "that cleanup could remove. Changes nothing")
+
+    def execute(self, context):
+        arm = _rig_active_armature(context)
+        if arm is None:
+            self.report({"WARNING"}, "Select the imported armature first")
+            return {"CANCELLED"}
+        names = [b.name for b in arm.data.bones]
+        chains = rig_detect_chains(names)
+        weighted = _rig_weighted_bones(arm)
+        parent_of = {b.name: (b.parent.name if b.parent else None) for b in arm.data.bones}
+        clean = rig_clean_plan(names, parent_of, weighted)
+        n_arms = sum(1 for s in ("L", "R") if chains["arms"][s])
+        n_legs = sum(1 for s in ("L", "R") if chains["legs"][s])
+        n_fing = sum(len(chains["fingers"][s]) for s in ("L", "R"))
+        msg = ("%d bones | spine %d, neck %d, head %s | arms %d, legs %d, fingers %d "
+               "| face %d | weightless removable %d" % (
+                   len(names), len(chains["spine"]), len(chains["neck"]),
+                   "yes" if chains["head"] else "no", n_arms, n_legs, n_fing,
+                   len(chains["face"]), len(clean["remove"])))
+        arm["glacier_rig_report"] = msg
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
+class GLACIER_OT_rig_clean(bpy.types.Operator):
+    bl_idname = "glacier.rig_clean"
+    bl_label = "Clean Skeleton"
+    bl_description = ("Remove weightless helper / attacher / end bones from the "
+                      "skeleton and delete their empty vertex groups. Surviving "
+                      "bones are re-parented across the gaps")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        arm = _rig_active_armature(context)
+        if arm is None:
+            self.report({"WARNING"}, "Select the imported armature first")
+            return {"CANCELLED"}
+        names = [b.name for b in arm.data.bones]
+        weighted = _rig_weighted_bones(arm)
+        parent_of = {b.name: (b.parent.name if b.parent else None) for b in arm.data.bones}
+        plan = rig_clean_plan(names, parent_of, weighted)
+        if not plan["remove"]:
+            self.report({"INFO"}, "Nothing to clean - no weightless removable bones")
+            return {"FINISHED"}
+        if context.scene.glacier_rig_clean_dryrun:
+            self.report({"INFO"}, "Dry run: would remove %d bones (%s%s)" % (
+                len(plan["remove"]), ", ".join(plan["remove"][:8]),
+                "..." if len(plan["remove"]) > 8 else ""))
+            return {"FINISHED"}
+        context.view_layer.objects.active = arm
+        _rig_clean_apply(arm, plan)
+        self.report({"INFO"}, "Removed %d weightless bones" % len(plan["remove"]))
+        return {"FINISHED"}
+
+
+class GLACIER_OT_rig_build(bpy.types.Operator):
+    bl_idname = "glacier.rig_build"
+    bl_label = "Build Control Rig"
+    bl_description = ("Generate FK + IK controllers on the armature. The deform "
+                      "bones follow the controls; arms and legs get IK with pole "
+                      "targets and an IK/FK switch; twist bones follow their parent")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        arm = _rig_active_armature(context)
+        if arm is None:
+            self.report({"WARNING"}, "Select the imported armature first")
+            return {"CANCELLED"}
+        sc = context.scene
+        names = [b.name for b in arm.data.bones]
+        chains = rig_detect_chains(names)
+        opts = {
+            "ik_arms": sc.glacier_rig_ik_arms,
+            "ik_legs": sc.glacier_rig_ik_legs,
+            "foot_roll": sc.glacier_rig_foot_roll,
+            "twist_follow": sc.glacier_rig_twist,
+        }
+        plan = rig_control_plan(chains, opts)
+        context.view_layer.objects.active = arm
+        _rig_make_controls(arm, plan["controls"])
+        _rig_apply_relations(arm, plan)
+        _rig_organize_collections(arm)
+        arm["glacier_has_control_rig"] = True
+        try:
+            arm.show_in_front = True
+        except Exception:
+            pass
+        self.report({"INFO"}, "Built %d controllers, %d IK chain(s) - deform bones "
+                    "hidden in the DEF collection" % (len(plan["controls"]), len(plan["ik"])))
+        return {"FINISHED"}
+
+
+class GLACIER_OT_rig_face(bpy.types.Operator):
+    bl_idname = "glacier.rig_face"
+    bl_label = "Build Facial Rig"
+    bl_description = ("Add facial controllers from the head's face bones: an "
+                      "eye-aim target the eyes track, a jaw control, and FK "
+                      "controllers for lids, brows, lips and cheeks")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        arm = _rig_active_armature(context)
+        if arm is None:
+            self.report({"WARNING"}, "Select the imported armature first")
+            return {"CANCELLED"}
+        names = [b.name for b in arm.data.bones]
+        chains = rig_detect_chains(names)
+        if not chains["face"]:
+            self.report({"WARNING"}, "No facial bones detected on this skeleton")
+            return {"CANCELLED"}
+        plan = rig_face_plan(chains, chains["head"] or (chains["neck"][-1] if chains["neck"] else None))
+        context.view_layer.objects.active = arm
+        _rig_make_controls(arm, plan["controls"])
+        _rig_apply_face(arm, plan)
+        _rig_organize_collections(arm)
+        arm["glacier_has_face_rig"] = True
+        self.report({"INFO"}, "Built %d face controllers (%d eye aims) - face "
+                    "deform bones hidden" % (len(plan["controls"]), len(plan["aim"])))
+        return {"FINISHED"}
+
+
+class GLACIER_OT_rig_remove(bpy.types.Operator):
+    bl_idname = "glacier.rig_remove"
+    bl_label = "Remove Control Rig"
+    bl_description = ("Delete every generated CTRL-/MCH- controller bone and the "
+                      "constraints that point at them, leaving the clean deform "
+                      "skeleton")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        arm = _rig_active_armature(context)
+        if arm is None:
+            return {"CANCELLED"}
+        # strip generated constraints from deform bones
+        for pb in arm.pose.bones:
+            for con in list(pb.constraints):
+                if con.name in ("RIG-fk", "RIG-ik", "RIG-twist", "RIG-face",
+                                "RIG-eye-aim"):
+                    pb.constraints.remove(con)
+        context.view_layer.objects.active = arm
+        bpy.ops.object.mode_set(mode="EDIT")
+        ebs = arm.data.edit_bones
+        for eb in list(ebs):
+            if eb.name.startswith(("CTRL-", "MCH-")):
+                ebs.remove(eb)
+        bpy.ops.object.mode_set(mode="OBJECT")
+        # un-hide the deform skeleton again
+        for nm in (RIG_DEF_COLL, RIG_MCH_COLL):
+            coll = arm.data.collections.get(nm) if hasattr(arm.data.collections, "get") else None
+            if coll is not None:
+                try:
+                    coll.is_visible = True
+                except Exception:
+                    pass
+        arm["glacier_has_control_rig"] = False
+        arm["glacier_has_face_rig"] = False
+        self.report({"INFO"}, "Control rig removed")
+        return {"FINISHED"}
+
+
+
+
+# =============================================================================
+# ANIMATION IMPORT  -  preview Glacier 2 animations on the imported skeleton
+# -----------------------------------------------------------------------------
+# Goal: load an animation and PLAY it on the armature in Blender (preview only,
+# no export yet). The pipeline has three layers:
+#
+#   1. A bpy-free animation model (GlacierAnim) + a JSON loader. This is the
+#      working preview path today: per-bone local pose keyframes -> a Blender
+#      Action you can scrub. Fully unit-tested.
+#   2. A binary "probe" that reads the IOI container header (u64 header_offset
+#      then the header table) and reports the fields it finds, so the native
+#      track layout can be mapped from a real sample file.
+#   3. The apply step that writes the keyframes onto the pose bones.
+#
+# The native Glacier 2 / KNT animation resource is not documented in any of the
+# project references and is most likely Havok-compressed, so the binary decoder
+# is intentionally a calibrated-on-sample scaffold rather than a guess that would
+# produce wrong motion. The JSON bridge lets you preview now (dump keyframes from
+# any source into the documented schema) while the binary path is finished from a
+# sample.
+# =============================================================================
+
+ANIM_JSON_SCHEMA = (
+    '{ "fps": 30, "frame_start": 1, "bones": { '
+    '"spine_01": [ {"frame":1, "rotation":[1,0,0,0], "location":[0,0,0], '
+    '"scale":[1,1,1]}, ... ] } }  - rotation is quaternion w,x,y,z in the bone\'s '
+    'local pose space; location/scale optional.')
+
+
+class GlacierAnimError(Exception):
+    pass
+
+
+class GlacierAnim:
+    """fps, frame range and a dict of {bone_name: [keyframes]} where each key is
+    (frame:int, location:(x,y,z)|None, quat_wxyz:(w,x,y,z)|None, scale:(x,y,z)|None)."""
+    def __init__(self, fps=30.0, frame_start=1):
+        self.fps = float(fps)
+        self.frame_start = int(frame_start)
+        self.tracks = {}
+
+    @property
+    def frame_end(self):
+        end = self.frame_start
+        for keys in self.tracks.values():
+            for k in keys:
+                if k[0] > end:
+                    end = k[0]
+        return end
+
+    @property
+    def bone_count(self):
+        return len(self.tracks)
+
+    @property
+    def key_count(self):
+        return sum(len(v) for v in self.tracks.values())
+
+
+def _anim_vec(seq, n, default):
+    if seq is None:
+        return None
+    try:
+        vals = [float(x) for x in seq]
+    except (TypeError, ValueError):
+        return None
+    if len(vals) < n:
+        vals = vals + list(default[len(vals):])
+    return tuple(vals[:n])
+
+
+def anim_from_json(data):
+    """Build a GlacierAnim from the documented JSON schema (dict already parsed)."""
+    if not isinstance(data, dict):
+        raise GlacierAnimError("animation JSON must be an object")
+    bones = data.get("bones")
+    if not isinstance(bones, dict) or not bones:
+        raise GlacierAnimError("animation JSON has no 'bones' map")
+    anim = GlacierAnim(fps=data.get("fps", 30), frame_start=data.get("frame_start", 1))
+    for bone_name, keys in bones.items():
+        if not isinstance(keys, list):
+            continue
+        track = []
+        for k in keys:
+            if not isinstance(k, dict):
+                continue
+            frame = int(k.get("frame", anim.frame_start))
+            loc = _anim_vec(k.get("location"), 3, (0.0, 0.0, 0.0))
+            rot = _anim_vec(k.get("rotation"), 4, (1.0, 0.0, 0.0, 0.0))
+            scl = _anim_vec(k.get("scale"), 3, (1.0, 1.0, 1.0))
+            track.append((frame, loc, rot, scl))
+        if track:
+            track.sort(key=lambda t: t[0])
+            anim.tracks[str(bone_name)] = track
+    if not anim.tracks:
+        raise GlacierAnimError("no usable keyframes found in animation JSON")
+    return anim
+
+
+def anim_match_report(anim, bone_names):
+    """How well the animation's tracks line up with an armature's bones."""
+    have = set(bone_names)
+    matched = [b for b in anim.tracks if b in have]
+    missing = [b for b in anim.tracks if b not in have]
+    return {"matched": sorted(matched), "missing": sorted(missing),
+            "matched_count": len(matched), "missing_count": len(missing)}
+
+
+def anim_probe_binary(raw):
+    """Read the IOI container header without decoding tracks, returning the raw
+    fields so the native layout can be identified. Mirrors the PRIM/BORG pattern
+    (leading u64 header_offset, then a small header table)."""
+    import struct
+    if len(raw) < 16:
+        raise GlacierAnimError("file too small to be a Glacier container")
+    header_offset = struct.unpack_from("<Q", raw, 0)[0]
+    info = {"size": len(raw), "header_offset": header_offset}
+    if not (0 < header_offset < len(raw) - 8):
+        info["note"] = "header_offset out of range - not a recognised container"
+        return info
+    fields = []
+    for i in range(8):
+        off = header_offset + i * 4
+        if off + 4 <= len(raw):
+            fields.append(struct.unpack_from("<I", raw, off)[0])
+    info["header_u32"] = fields
+    info["header_f32"] = [struct.unpack_from("<f", raw, header_offset + i * 4)[0]
+                          for i in range(8) if header_offset + i * 4 + 4 <= len(raw)]
+    return info
+
+
+def anim_parse_binary(raw, bone_names, bind_poses=None):
+    """Best-effort native parse. Until the track layout is calibrated from a
+    sample this raises with the probe diagnostics rather than emitting wrong
+    motion. The probe info is attached so the importer can surface it."""
+    info = anim_probe_binary(raw)
+    raise GlacierAnimError(
+        "Native Glacier 2 animation decoding needs a sample file to calibrate. "
+        "Header probe: %r. Use the JSON preview path for now." % info)
+
+
+# ----- bpy apply ------------------------------------------------------------
+def _anim_apply(arm_obj, anim, action_name="GlacierAnim", clear=True):
+    """Write the animation's per-bone local pose keyframes onto `arm_obj` as a
+    new Action and return (matched_bone_count, inserted_key_count)."""
+    if arm_obj is None or getattr(arm_obj, "type", "") != "ARMATURE":
+        raise GlacierAnimError("no armature to apply the animation to")
+    if arm_obj.animation_data is None:
+        arm_obj.animation_data_create()
+    action = bpy.data.actions.new(action_name)
+    arm_obj.animation_data.action = action
+
+    matched = 0
+    inserted = 0
+    for bone_name, keys in anim.tracks.items():
+        pb = arm_obj.pose.bones.get(bone_name)
+        if pb is None:
+            continue
+        matched += 1
+        try:
+            pb.rotation_mode = "QUATERNION"
+        except Exception:
+            pass
+        for frame, loc, rot, scl in keys:
+            if loc is not None:
+                pb.location = loc
+                pb.keyframe_insert(data_path="location", frame=frame)
+                inserted += 1
+            if rot is not None:
+                pb.rotation_quaternion = rot
+                pb.keyframe_insert(data_path="rotation_quaternion", frame=frame)
+                inserted += 1
+            if scl is not None:
+                pb.scale = scl
+                pb.keyframe_insert(data_path="scale", frame=frame)
+                inserted += 1
+    sc = bpy.context.scene
+    try:
+        sc.render.fps = max(1, int(round(anim.fps)))
+        sc.frame_start = min(sc.frame_start, anim.frame_start)
+        sc.frame_end = max(sc.frame_end, anim.frame_end)
+        sc.frame_set(anim.frame_start)
+    except Exception:
+        pass
+    return matched, inserted
+
+
+def _anim_read_file(filepath):
+    """Load a file as either the JSON preview schema or a binary container.
+    Returns a GlacierAnim (JSON) or raises GlacierAnimError (binary, with probe)."""
+    import json
+    with open(filepath, "rb") as f:
+        raw = f.read()
+    stripped = raw.lstrip()[:1]
+    if stripped in (b"{", b"["):
+        try:
+            return anim_from_json(json.loads(raw.decode("utf-8")))
+        except GlacierAnimError:
+            raise
+        except Exception as e:
+            raise GlacierAnimError("could not parse JSON animation: %s" % e)
+    return anim_parse_binary(raw, [])
+
+
+class IMPORT_SCENE_OT_glacier2_anim(bpy.types.Operator, ImportHelper):
+    bl_idname = "import_scene.glacier2_anim"
+    bl_label = "Import Glacier 2 Animation"
+    bl_description = ("Load an animation onto the active/target armature for "
+                      "preview. Accepts the documented JSON keyframe schema now; "
+                      "native .anim files are probed and reported")
+    bl_options = {"REGISTER", "UNDO"}
+    filename_ext = ".json"
+    filter_glob: StringProperty(default="*.json;*.anim;*. animset;*.*", options={"HIDDEN"})
+
+    def execute(self, context):
+        arm = _rig_active_armature(context)
+        if arm is None:
+            self.report({"WARNING"}, "Select / set the target armature first")
+            return {"CANCELLED"}
+        try:
+            anim = _anim_read_file(self.filepath)
+        except GlacierAnimError as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+        names = [b.name for b in arm.data.bones]
+        rep = anim_match_report(anim, names)
+        if rep["matched_count"] == 0:
+            self.report({"WARNING"}, "None of the animation's %d bone tracks match "
+                        "this armature's bone names" % anim.bone_count)
+            return {"CANCELLED"}
+        context.view_layer.objects.active = arm
+        import os as _os
+        try:
+            matched, inserted = _anim_apply(
+                arm, anim, action_name=_os.path.basename(self.filepath))
+        except GlacierAnimError as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+        arm["glacier_anim_report"] = ("%s: %d/%d bone tracks matched, %d keys, "
+                                      "frames %d-%d @ %dfps" % (
+                                          _os.path.basename(self.filepath), matched,
+                                          anim.bone_count, inserted, anim.frame_start,
+                                          anim.frame_end, int(round(anim.fps))))
+        self.report({"INFO"}, arm["glacier_anim_report"])
+        return {"FINISHED"}
+
+
+class GLACIER_OT_anim_clear(bpy.types.Operator):
+    bl_idname = "glacier.anim_clear"
+    bl_label = "Clear Animation"
+    bl_description = "Remove the active animation Action from the target armature"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        arm = _rig_active_armature(context)
+        if arm is None or arm.animation_data is None:
+            return {"CANCELLED"}
+        arm.animation_data.action = None
+        self.report({"INFO"}, "Animation cleared")
+        return {"FINISHED"}
 
 
 _panel_classes = (
     GlacierRefOverride,
     GlacierTexSlot,
+    GlacierRenderSlot,
     GlacierMatParam,
     GlacierMaterial,
     GLACIER_UL_overrides,
     GLACIER_UL_materials,
+    GLACIER_UL_render_slots,
+    GLACIER_OT_pull_reference,
     GLACIER_OT_decode_texture,
     GLACIER_OT_fill_hashes,
     GLACIER_OT_decode_model,
@@ -5795,11 +8841,27 @@ _panel_classes = (
     GLACIER_OT_override_refresh,
     GLACIER_OT_scan_folder,
     GLACIER_OT_load_material_file,
+    GLACIER_OT_update_names,
     GLACIER_OT_override_add,
     GLACIER_OT_override_remove,
     GLACIER_OT_lod_show_all,
     GLACIER_OT_lod_show_lod0,
     GLACIER_OT_inspect_texture,
+    GlacierChunkEntry,
+    GLACIER_UL_chunk_entries,
+    GLACIER_OT_chunk_scan,
+    GLACIER_OT_chunk_refresh,
+    GLACIER_OT_chunk_select,
+    GLACIER_OT_chunk_paste_select,
+    GLACIER_OT_chunk_extract,
+    GLACIER_OT_chunk_browser,
+    GLACIER_OT_rig_analyze,
+    GLACIER_OT_rig_clean,
+    GLACIER_OT_rig_build,
+    GLACIER_OT_rig_face,
+    GLACIER_OT_rig_remove,
+    IMPORT_SCENE_OT_glacier2_anim,
+    GLACIER_OT_anim_clear,
     VIEW3D_PT_glacier_mesh_tools,
 )
 
@@ -5812,6 +8874,8 @@ def menu_func_import(self, context):
                          text="Glacier 2 007 Model (.prim)")
     self.layout.operator(IMPORT_SCENE_OT_glacier2_borg.bl_idname,
                          text="Glacier 2 007 Skeleton (.borg)")
+    # Animation import is held back from the public build (kept registered for the
+    # dev panel only); re-add the File > Import entry when it ships.
 
 
 def menu_func_export(self, context):
@@ -5909,10 +8973,12 @@ def register():
                     "folders. Off = write everything flat into the Work Folder")
     bpy.types.Scene.glacier_names_file = bpy.props.StringProperty(
         name="Names File", subtype="FILE_PATH", default="",
-        description="Optional text / hash-list / dependency file that maps hashes to "
-                    "IOI paths (e.g. lines like '... [assembly:/.../head_bond_v1.mi]'). "
-                    "The addon reads the real material name from it. Leave blank to "
-                    "auto-scan the material folders for such a file")
+        description="Optional. Maps hashes to readable IOI paths so materials show real "
+                    "names instead of hashes. HOW TO GET ONE: in RPKG-Tool use 'Generate "
+                    "Hash List' (or any hashlist / dependency .txt with lines like "
+                    "'...[assembly:/.../head_bond_v1.mi]'); or just point this at the "
+                    "folder of .meta.json files RPKG-Tool wrote when you extracted - they "
+                    "contain the paths. Leave blank to auto-scan the material folders")
     bpy.types.Scene.glacier_show_io = bpy.props.BoolProperty(default=True)
     bpy.types.Scene.glacier_show_mats = bpy.props.BoolProperty(default=True)
     bpy.types.Scene.glacier_show_render = bpy.props.BoolProperty(default=True)
@@ -5927,9 +8993,72 @@ def register():
              "Build only the active material and apply it to the selected objects"),
         ])
     bpy.types.Scene.glacier_show_edit = bpy.props.BoolProperty(default=True)
+    bpy.types.Scene.glacier_show_source = bpy.props.BoolProperty(default=False)
+    bpy.types.Scene.glacier_render_slots = bpy.props.CollectionProperty(
+        type=GlacierRenderSlot)
+    bpy.types.Scene.glacier_render_slots_index = bpy.props.IntProperty(default=0)
+    bpy.types.Scene.glacier_render_from_reference = bpy.props.BoolProperty(
+        name="Use This List When Building", default=True,
+        description="Build the render material strictly from the textures pulled from "
+                    "reference (above), instead of from the export texture overrides. "
+                    "Turn off to go back to using the Edit Material overrides")
     bpy.types.Scene.glacier_show_swap = bpy.props.BoolProperty(default=False)
     bpy.types.Scene.glacier_show_conv = bpy.props.BoolProperty(default=False)
     bpy.types.Scene.glacier_show_lod = bpy.props.BoolProperty(default=False)
+    # ---- RPKG chunk browser ----
+    bpy.types.Scene.glacier_show_chunk = bpy.props.BoolProperty(default=False)
+    bpy.types.Scene.glacier_chunk_path = bpy.props.StringProperty(
+        name="Chunk", subtype="FILE_PATH",
+        description="The game's packed chunkNN.rpkg (in the Runtime folder)")
+    bpy.types.Scene.glacier_chunk_out = bpy.props.StringProperty(
+        name="Extract To", subtype="DIR_PATH",
+        description="Where extracted .TEXT/.TEXD go. Blank uses the Work folder")
+    bpy.types.Scene.glacier_chunk_filter = bpy.props.EnumProperty(
+        name="Show", items=_CHUNK_FILTER_ITEMS, default="TEXTD")
+    bpy.types.Scene.glacier_chunk_search = bpy.props.StringProperty(
+        name="Search", description="Show only hashes containing this text")
+    bpy.types.Scene.glacier_chunk_decode = bpy.props.BoolProperty(
+        name="Also decode to PNG",
+        description="After extracting, decode each TEXT (+paired TEXD) to a PNG",
+        default=False)
+    bpy.types.Scene.glacier_chunk_xor_key = bpy.props.StringProperty(
+        name="XOR Key",
+        description="Advanced: hex XOR descramble key. Blank = default key")
+    bpy.types.Scene.glacier_chunk_paste_hashes = bpy.props.StringProperty(
+        name="Hash List",
+        description="Paste a list of 16-hex hashes to auto-select in the browser. "
+                    "Any separator works (newlines, commas, spaces, tabs)")
+    bpy.types.Scene.glacier_chunk_entries = bpy.props.CollectionProperty(
+        type=GlacierChunkEntry)
+    bpy.types.Scene.glacier_chunk_index = bpy.props.IntProperty(default=0)
+    bpy.types.Scene.glacier_chunk_total = bpy.props.IntProperty(default=0)
+    bpy.types.Scene.glacier_chunk_shown = bpy.props.IntProperty(default=0)
+    bpy.types.Scene.glacier_chunk_matching = bpy.props.IntProperty(default=0)
+
+    # ----- Control Rig properties -----
+    def _rig_is_armature(self, obj):
+        return getattr(obj, "type", None) == "ARMATURE"
+    bpy.types.Scene.glacier_show_rig = bpy.props.BoolProperty(default=False)
+    bpy.types.Scene.glacier_rig_target = bpy.props.PointerProperty(
+        name="Armature", type=bpy.types.Object, poll=_rig_is_armature,
+        description="The imported skeleton to rig (defaults to the active armature)")
+    bpy.types.Scene.glacier_rig_ik_arms = bpy.props.BoolProperty(
+        name="IK Arms", default=True,
+        description="Build IK chains + pole targets and an IK/FK switch for arms")
+    bpy.types.Scene.glacier_rig_ik_legs = bpy.props.BoolProperty(
+        name="IK Legs", default=True,
+        description="Build IK chains + pole targets and an IK/FK switch for legs")
+    bpy.types.Scene.glacier_rig_foot_roll = bpy.props.BoolProperty(
+        name="Foot Roll", default=True,
+        description="Add a foot-roll control when heel/ball/toe bones are present")
+    bpy.types.Scene.glacier_rig_twist = bpy.props.BoolProperty(
+        name="Twist Follow", default=True,
+        description="Make twist/roll bones follow their parent's rotation")
+    bpy.types.Scene.glacier_rig_clean_dryrun = bpy.props.BoolProperty(
+        name="Dry Run", default=True,
+        description="Only report which bones cleanup would remove, don't delete")
+    bpy.types.Scene.glacier_show_anim = bpy.props.BoolProperty(default=False)
+
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
 
@@ -5937,11 +9066,29 @@ def register():
 def unregister():
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
+    for _p in ("glacier_show_anim", "glacier_rig_clean_dryrun", "glacier_rig_twist",
+               "glacier_rig_foot_roll", "glacier_rig_ik_legs", "glacier_rig_ik_arms",
+               "glacier_rig_target", "glacier_show_rig"):
+        try:
+            delattr(bpy.types.Scene, _p)
+        except Exception:
+            pass
+    for _p in ("glacier_chunk_matching", "glacier_chunk_shown",
+               "glacier_chunk_total", "glacier_chunk_index", "glacier_chunk_entries",
+               "glacier_chunk_xor_key", "glacier_chunk_paste_hashes",
+               "glacier_chunk_decode", "glacier_chunk_search",
+               "glacier_chunk_filter", "glacier_chunk_out", "glacier_chunk_path",
+               "glacier_show_chunk"):
+        try:
+            delattr(bpy.types.Scene, _p)
+        except Exception:
+            pass
     del bpy.types.Scene.glacier_lod_level
     del bpy.types.Scene.glacier_show_lod
     del bpy.types.Scene.glacier_show_conv
     del bpy.types.Scene.glacier_show_swap
     del bpy.types.Scene.glacier_show_edit
+    del bpy.types.Scene.glacier_show_source
     del bpy.types.Scene.glacier_show_mats
     del bpy.types.Scene.glacier_show_io
     del bpy.types.Scene.glacier_show_render
