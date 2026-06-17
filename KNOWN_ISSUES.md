@@ -59,10 +59,10 @@
 - **Workaround:** Downscale the texture before encoding, or split it into multiple smaller textures.
 - **Status:** Rare edge case. Proper support planned for v1.16.
 
-#### 8. **Export dialog's Search Folder doesn't work on Windows UNC paths (network shares)**
+#### 8. **Export dialogue's Search Folder doesn't work on Windows UNC paths (network shares)**
 - **Severity:** Medium (Windows only)
 - **Description:** Pointing the export Search Folder at a network share (`\\server\share\...`) doesn't search correctly.
-- **Cause:** Path normalization strips the UNC prefix.
+- **Cause:** Path normalisation strips the UNC prefix.
 - **Workaround:** Copy your textures to a local drive (C:\, D:\, etc.) and point Search Folder there.
 - **Status:** Will fix path handling in v1.15.
 
@@ -156,29 +156,6 @@ These were fixed in the latest version:
 
 ---
 
-## Planned Fixes (v1.15)
-
-- [ ] Parameter updates trigger render material rebuild
-- [ ] Metadata reconstruction for models with new vertex colors
-- [ ] Bone weight normalization in Hitman converter
-- [ ] Error-skipping in batch conversion
-- [ ] Shape key driver remapping in converter
-- [ ] Dot/underscore metadata naming detection
-- [ ] UNC path support on Windows
-
----
-
-## Planned Features (v1.16+)
-
-- [ ] Support for >8192px textures
-- [ ] Custom bone-map UI for non-standard Hitman rigs
-- [ ] Automatic reference rig loading in converter
-- [ ] Weight painting tools in the 007 toolkit
-- [ ] Real-time normal map preview
-- [ ] Multi-material mesh splitting tools
-
----
-
 ## Reporting Issues
 
 If you encounter a problem not listed here:
@@ -191,9 +168,5 @@ If you encounter a problem not listed here:
 If the issue persists, post on Nexus Mods or report via the linked GitHub repository with:
 - Blender version
 - A minimal `.blend` file that reproduces the issue
-- The exact error message or description of the wrong behavior
+- The exact error message or description of the wrong behaviour
 - Steps to reproduce
-
----
-
-**007 First Light Toolkit v1.14** — Hitman to 007 Converter v1.0
