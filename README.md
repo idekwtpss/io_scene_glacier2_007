@@ -82,6 +82,4 @@ Built by the Glacier modding community.
 - **RPKG-Tool:** https://github.com/glacier-modding/RPKG-Tool
 - **Issues:** https://github.com/glacier-modding/io_scene_glacier2_007/issues
 
----
 
-**007 First Light Toolkit v1.14** — The complete Blender modding toolkit for 007 First Light.
