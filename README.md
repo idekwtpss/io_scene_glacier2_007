@@ -80,6 +80,6 @@ Built by the Glacier modding community.
 ## Links
 
 - **RPKG-Tool:** https://github.com/glacier-modding/RPKG-Tool
-- **Issues:** https://github.com/glacier-modding/io_scene_glacier2_007/issues
+- **Issues:** [https://github.com/glacier-modding/io_scene_glacier2_007/issues](https://github.com/idekwtpss/io_scene_glacier2_007/blob/main/KNOWN_ISSUES.md)
 
 
