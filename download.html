@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Download — 007 First Light Toolkit</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0b0b0d;--bg2:#0f0f12;--card:#16161a;--card2:#1b1b20;
+  --line:#26262b;--line2:#34343b;
+  --tx:#f0efe9;--dim:#9b968c;--faint:#6a665e;
+  --gold:#c9a23f;--gold-b:#e3c163;--gold-d:#7c6526;
+  --green:#6fbf73;
+  --ease:cubic-bezier(.16,1,.3,1);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--tx);font-family:Inter,system-ui,sans-serif;line-height:1.65;-webkit-font-smoothing:antialiased;overflow-x:hidden;min-height:100vh;display:flex;flex-direction:column}
+a{color:var(--gold);text-decoration:none}
+a:hover{color:var(--gold-b)}
+code{background:#0e0e10;border:1px solid var(--line);border-radius:4px;padding:1px 6px;color:var(--gold);font-family:"JetBrains Mono",monospace;font-size:.82em}
+::selection{background:rgba(201,162,63,.26)}
+
+/* NAV */
+.bar{position:fixed;top:0;left:0;right:0;z-index:200;background:rgba(11,11,13,.92);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-bottom:1px solid var(--line)}
+.bar .in{max-width:1200px;margin:0 auto;padding:0 20px;height:56px;display:flex;align-items:center;gap:10px}
+.logo{display:flex;align-items:center;gap:10px;font-family:Oswald;font-weight:600;letter-spacing:.1em;text-transform:uppercase;font-size:13px;color:var(--tx)}
+.logo-txt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.badge-sm{width:26px;height:26px;border-radius:50%;border:1.5px solid var(--gold);display:grid;place-items:center;color:var(--gold);font:700 8px "JetBrains Mono";flex:none}
+.spacer{flex:1}
+.nav-links{display:flex;align-items:center;gap:2px}
+.nav-links a{font:500 13px Inter;color:var(--dim);padding:8px 12px;border-radius:6px;transition:.15s;white-space:nowrap;min-height:44px;display:flex;align-items:center}
+.nav-links a:hover{color:var(--tx);background:rgba(255,255,255,.05)}
+
+/* HERO */
+.dl-hero{padding:120px 24px 56px;text-align:center;position:relative;overflow:hidden;border-bottom:1px solid var(--line)}
+.dl-hero::before{content:"";position:absolute;inset:0;background:radial-gradient(ellipse 80% 60% at 50% 0%,rgba(100,68,4,.18) 0,transparent 65%),var(--bg)}
+.dl-hero .inner{position:relative;z-index:1;max-width:640px;margin:0 auto}
+.dl-hero .ey{font:600 11px "JetBrains Mono";letter-spacing:.28em;text-transform:uppercase;color:var(--gold);margin:0 0 14px;opacity:0;animation:fadeIn .5s ease .1s forwards}
+.dl-hero h1{font-family:Oswald;font-weight:700;text-transform:uppercase;letter-spacing:.12em;font-size:clamp(26px,5.5vw,50px);margin:0 0 12px;opacity:0;animation:slideUp .65s var(--ease) .25s forwards}
+.dl-hero .sub{color:var(--dim);font-size:15px;opacity:0;animation:fadeIn .6s ease .45s forwards}
+
+/* MAIN */
+main{flex:1;padding:0 24px 80px}
+.inner{max-width:780px;margin:0 auto;padding-top:52px}
+
+/* VERSION CARD */
+.ver-card{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;margin-bottom:24px}
+.ver-top{padding:24px 28px;display:flex;align-items:flex-start;gap:18px;flex-wrap:wrap}
+.ver-badge{font:700 20px Oswald;letter-spacing:.08em;color:var(--gold);background:rgba(201,162,63,.09);border:1px solid rgba(201,162,63,.2);border-radius:8px;padding:7px 16px;white-space:nowrap;flex:none}
+.ver-info{flex:1;min-width:180px}
+.ver-info h2{font-family:Oswald;font-weight:700;text-transform:uppercase;letter-spacing:.06em;font-size:18px;margin:0 0 4px}
+.ver-info p{color:var(--dim);font-size:13px;margin:0 0 10px}
+.ver-meta{display:flex;gap:6px;flex-wrap:wrap}
+.vtag{font:600 10px "JetBrains Mono";letter-spacing:.08em;text-transform:uppercase;color:var(--dim);background:var(--bg2);border:1px solid var(--line);border-radius:4px;padding:3px 9px}
+.vtag.new{color:var(--gold);border-color:rgba(201,162,63,.2);background:rgba(201,162,63,.07)}
+.ver-dl{padding:18px 28px;border-top:1px solid var(--line);background:rgba(0,0,0,.18);display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.btn-dl{display:inline-flex;align-items:center;gap:9px;padding:13px 32px;border-radius:8px;background:var(--gold);color:#080700;font:700 13px Oswald;letter-spacing:.16em;text-transform:uppercase;transition:.18s;min-height:48px}
+.btn-dl:hover{background:var(--gold-b);transform:translateY(-2px);box-shadow:0 8px 28px rgba(201,162,63,.25);color:#080700}
+.btn-dl svg{width:17px;height:17px;stroke-width:2.2;flex:none}
+.dl-note{color:var(--faint);font:500 12px "JetBrains Mono";letter-spacing:.06em}
+
+/* SECTIONS */
+.sec-t{font-family:Oswald;font-weight:700;text-transform:uppercase;letter-spacing:.08em;font-size:17px;margin:0 0 14px;display:flex;align-items:center;gap:12px;color:var(--tx)}
+.sec-t::after{content:"";flex:1;height:1px;background:var(--line)}
+.block{margin-bottom:36px}
+
+/* REQ GRID */
+.req-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.req{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px 20px}
+.req h4{font:600 11px "JetBrains Mono";letter-spacing:.16em;text-transform:uppercase;color:var(--gold);margin:0 0 8px}
+.req p{color:var(--dim);font-size:14px;line-height:1.65;margin:0}
+
+/* INSTALL STEPS */
+.is{display:flex;gap:12px;padding:0 0 20px;position:relative}
+.is:last-child{padding-bottom:0}
+.is::before{content:"";position:absolute;left:12px;top:26px;bottom:0;width:1px;background:var(--line)}
+.is:last-child::before{display:none}
+.is-n{width:26px;height:26px;border-radius:50%;border:1.5px solid var(--gold-d);display:grid;place-items:center;font:700 11px Oswald;color:var(--gold);flex:none;background:var(--bg);position:relative;z-index:1}
+.is-body strong{display:block;font:600 14px Inter;color:var(--tx);margin-bottom:2px;padding-top:2px}
+.is-body p{color:var(--dim);font-size:13px;margin:0;line-height:1.6}
+
+/* CHANGELOG */
+.cl-entry{display:flex;gap:14px;padding:14px 0;border-bottom:1px solid var(--line)}
+.cl-entry:last-child{border-bottom:none}
+.cl-ver{font:700 12px "JetBrains Mono";color:var(--gold);min-width:54px;padding-top:2px;flex:none}
+.cl-body p{color:var(--dim);font-size:14px;margin:0}
+.cl-body ul{color:var(--dim);font-size:14px;padding-left:16px;margin:4px 0 0}
+.cl-body li{margin-bottom:3px}
+.tag-fix{display:inline-block;font:700 9px "JetBrains Mono";letter-spacing:.07em;text-transform:uppercase;color:#080700;background:var(--green);border-radius:3px;padding:1px 6px;margin-right:4px;vertical-align:middle}
+.tag-new{display:inline-block;font:700 9px "JetBrains Mono";letter-spacing:.07em;text-transform:uppercase;color:#080700;background:var(--gold);border-radius:3px;padding:1px 6px;margin-right:4px;vertical-align:middle}
+
+/* GUIDE LINK */
+.guide-link{text-align:center;padding:36px 0 0;border-top:1px solid var(--line)}
+.guide-link p{color:var(--dim);font-size:14px;margin:0 auto 20px;max-width:400px}
+.btn-o{display:inline-flex;align-items:center;gap:8px;padding:12px 28px;border-radius:7px;border:1px solid var(--line2);color:var(--dim);font:600 13px Oswald;letter-spacing:.14em;text-transform:uppercase;transition:.18s;min-height:48px}
+.btn-o:hover{border-color:var(--gold-d);color:var(--tx)}
+
+/* REVEAL */
+.reveal{opacity:0;transform:translateY(16px);transition:opacity .5s var(--ease),transform .5s var(--ease)}
+.reveal.in{opacity:1;transform:none}
+[data-d="1"]{transition-delay:.07s}[data-d="2"]{transition-delay:.14s}[data-d="3"]{transition-delay:.21s}
+
+/* FOOTER */
+footer{border-top:1px solid var(--line);padding:24px 20px}
+footer .in{max-width:1200px;margin:0 auto;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px}
+footer .fl{font:600 11px Oswald;letter-spacing:.1em;text-transform:uppercase;color:var(--gold-d)}
+footer .fr{display:flex;gap:16px;flex-wrap:wrap}
+footer .fr a{font:400 13px Inter;color:var(--faint);transition:.15s}
+footer .fr a:hover{color:var(--tx)}
+footer .fc{color:var(--faint);font-size:12px}
+
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes slideUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}
+
+@media(max-width:600px){
+  .req-grid{grid-template-columns:1fr}
+  .nav-links a:not(.cta){display:none}
+  .logo-txt{display:none}
+  .ver-top{flex-direction:column}
+  .ver-dl{flex-direction:column;align-items:flex-start}
+  .btn-dl{width:100%;justify-content:center}
+  main{padding-left:20px;padding-right:20px}
+  .dl-hero{padding:104px 20px 44px}
+}
+</style>
+</head>
+<body>
+
+<nav class="bar">
+  <div class="in">
+    <div class="logo">
+      <span class="badge-sm">007</span>
+      <span class="logo-txt">First Light Toolkit</span>
+    </div>
+    <div class="spacer"></div>
+    <div class="nav-links">
+      <a href="index.html">Home</a>
+      <a href="guide.html">Guide</a>
+      <a href="source.html">Source</a>
+    </div>
+  </div>
+</nav>
+
+<div class="dl-hero">
+  <div class="inner">
+    <p class="ey">Blender Addon</p>
+    <h1>DOWNLOAD</h1>
+    <p class="sub">Free. No installer. Drop it into Blender 4.2+ and start modding.</p>
+  </div>
+</div>
+
+<main>
+  <div class="inner">
+
+    <div class="ver-card reveal">
+      <div class="ver-top">
+        <div class="ver-badge">v2.9.3</div>
+        <div class="ver-info">
+          <h2>Latest Release</h2>
+          <p>Glacier 2 / KNT Engine · Blender 4.2+ · Windows 64-bit</p>
+          <div class="ver-meta">
+            <span class="vtag new">Bone Remap Fix</span>
+            <span class="vtag new">Snap to Game Slot</span>
+            <span class="vtag">Custom Mesh Export</span>
+            <span class="vtag">RPKG Packer</span>
+            <span class="vtag">Cloth Support</span>
+          </div>
+        </div>
+      </div>
+      <div class="ver-dl">
+        <a href="glacier2_007_toolkit.zip" download class="btn-dl">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Download v2.9.3
+        </a>
+        <span class="dl-note">glacier2_007_toolkit.zip · Free</span>
+      </div>
+    </div>
+
+    <div class="block">
+      <h3 class="sec-t reveal">Requirements</h3>
+      <div class="req-grid">
+        <div class="req reveal" data-d="1">
+          <h4>Blender</h4>
+          <p><code>4.2</code> or later. Earlier versions are not supported.</p>
+        </div>
+        <div class="req reveal" data-d="2">
+          <h4>OS</h4>
+          <p>Windows 64-bit. The native RPKG packer DLL is Windows-only.</p>
+        </div>
+        <div class="req reveal" data-d="1">
+          <h4>Game Files</h4>
+          <p>007 First Light (PC). Use RPKG-Tool to extract assets before importing.</p>
+        </div>
+        <div class="req reveal" data-d="2">
+          <h4>RPKG-Tool</h4>
+          <p>Required to extract game archives. Download separately.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="block">
+      <h3 class="sec-t reveal">Installation</h3>
+      <div class="is reveal" data-d="1"><div class="is-n">1</div><div class="is-body"><strong>Download the zip</strong><p>Save <code>glacier2_007_toolkit.zip</code> anywhere. Don't extract it.</p></div></div>
+      <div class="is reveal" data-d="2"><div class="is-n">2</div><div class="is-body"><strong>Install in Blender</strong><p>Edit → Preferences → Add-ons → <em>Install from Disk…</em> → select the zip.</p></div></div>
+      <div class="is reveal" data-d="3"><div class="is-n">3</div><div class="is-body"><strong>Enable</strong><p>Search <em>"Glacier"</em>, tick the checkbox, <em>Save Preferences</em>.</p></div></div>
+      <div class="is reveal" data-d="1"><div class="is-n">4</div><div class="is-body"><strong>Open the panel</strong><p>3D Viewport → <code>N</code> → <strong>Glacier</strong> tab.</p></div></div>
+    </div>
+
+    <div class="block">
+      <h3 class="sec-t reveal">Changelog</h3>
+      <div class="cl-entry reveal">
+        <div class="cl-ver">2.9.3</div>
+        <div class="cl-body">
+          <ul>
+            <li><span class="tag-fix">FIX</span> Bone-remap table corrected for custom topology exports — skinned meshes no longer explode in-game when vertex count changes. All-0xFF remap was pointing every GPU palette slot to bone #255 (invalid).</li>
+            <li><span class="tag-new">NEW</span> <em>Snap Game Mesh to Custom Shape</em> — Shrinkwrap projects game-mesh verts onto a custom surface, keeping the original vertex count and rigging intact.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="cl-entry reveal">
+        <div class="cl-ver">2.8.0</div>
+        <div class="cl-body">
+          <ul><li><span class="tag-fix">FIX</span> Null-pointer crash from missing aux cull-cluster block on custom topology exports.</li></ul>
+        </div>
+      </div>
+      <div class="cl-entry reveal">
+        <div class="cl-ver">2.7.x</div>
+        <div class="cl-body">
+          <ul><li><span class="tag-new">NEW</span> RPKG packer integrated into the export panel.</li></ul>
+        </div>
+      </div>
+      <div class="cl-entry reveal">
+        <div class="cl-ver">2.6.x</div>
+        <div class="cl-body">
+          <ul><li><span class="tag-new">NEW</span> Cloth cage import / export.</li></ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="guide-link reveal">
+      <p>New to the toolkit? The guide covers everything from import to custom model swap.</p>
+      <a href="guide.html" class="btn-o">Read the Guide</a>
+    </div>
+
+  </div>
+</main>
+
+<footer>
+  <div class="in">
+    <span class="fl">007 First Light Toolkit</span>
+    <span class="fc">v2.9.3 · Blender 4.2+</span>
+    <div class="fr">
+      <a href="index.html">Home</a>
+      <a href="guide.html">Guide</a>
+      <a href="source.html">Source</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+const io=new IntersectionObserver(e=>{e.forEach(x=>{if(x.isIntersecting){x.target.classList.add('in');io.unobserve(x.target)}})},{threshold:.1});
+document.querySelectorAll('.reveal').forEach(el=>io.observe(el));
+</script>
+</body>
+</html>

@@ -1,0 +1,520 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Guide — 007 First Light Toolkit</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0b0b0d;--bg2:#0f0f12;--card:#16161a;--card2:#1b1b20;
+  --line:#26262b;--line2:#34343b;
+  --tx:#f0efe9;--dim:#9b968c;--faint:#6a665e;
+  --gold:#c9a23f;--gold-b:#e3c163;--gold-d:#7c6526;
+  --red:#b01e28;--blu:#5a8fd6;--green:#6fbf73;
+  --ease:cubic-bezier(.16,1,.3,1);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--tx);font-family:Inter,system-ui,sans-serif;line-height:1.65;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+a{color:var(--gold);text-decoration:none}
+a:hover{color:var(--gold-b)}
+::selection{background:rgba(201,162,63,.26)}
+code,.k{background:#0e0e10;border:1px solid var(--line);border-radius:4px;padding:1px 6px;color:var(--gold);font-family:"JetBrains Mono",monospace;font-size:.82em}
+pre{background:#0e0e10;border:1px solid var(--line);border-radius:8px;padding:16px 18px;overflow-x:auto;margin:12px 0}
+pre code{background:none;border:none;padding:0;font-size:.88em;color:var(--tx)}
+strong{color:var(--tx);font-weight:600}
+
+/* NAV */
+.bar{position:fixed;top:0;left:0;right:0;z-index:200;background:rgba(11,11,13,.92);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-bottom:1px solid var(--line)}
+.bar .in{max-width:1400px;margin:0 auto;padding:0 20px;height:56px;display:flex;align-items:center;gap:10px}
+.logo{display:flex;align-items:center;gap:10px;font-family:Oswald;font-weight:600;letter-spacing:.1em;text-transform:uppercase;font-size:13px;color:var(--tx)}
+.logo-txt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.badge-sm{width:26px;height:26px;border-radius:50%;border:1.5px solid var(--gold);display:grid;place-items:center;color:var(--gold);font:700 8px "JetBrains Mono";flex:none}
+.spacer{flex:1}
+.nav-links{display:flex;align-items:center;gap:2px}
+.nav-links a{font:500 13px Inter;color:var(--dim);padding:8px 12px;border-radius:6px;transition:.15s;white-space:nowrap;min-height:44px;display:flex;align-items:center}
+.nav-links a:hover{color:var(--tx);background:rgba(255,255,255,.05)}
+.nav-links .cta{color:var(--gold);border:1px solid var(--gold-d)}
+.nav-links .cta:hover{background:rgba(201,162,63,.1);color:var(--gold-b)}
+
+/* GUIDE HERO */
+.guide-hero{padding:110px 24px 52px;text-align:center;position:relative;overflow:hidden;border-bottom:1px solid var(--line)}
+.guide-hero::before{content:"";position:absolute;inset:0;background:radial-gradient(ellipse 80% 60% at 50% 0%,rgba(100,68,4,.18) 0,transparent 65%),var(--bg)}
+.guide-hero .inner{position:relative;z-index:1}
+.guide-hero .ey{font:600 11px "JetBrains Mono";letter-spacing:.28em;text-transform:uppercase;color:var(--gold);margin:0 0 12px}
+.guide-hero h1{font-family:Oswald;font-weight:700;text-transform:uppercase;letter-spacing:.12em;font-size:clamp(24px,5vw,48px);margin:0 0 10px}
+.guide-hero p{color:var(--dim);font-size:15px;max-width:500px;margin:0 auto}
+
+/* LAYOUT */
+.layout{max-width:1400px;margin:0 auto;padding:48px 20px 80px;display:grid;grid-template-columns:220px 1fr;gap:0;align-items:start}
+
+/* TOC */
+.toc{position:sticky;top:76px;padding-right:24px;border-right:1px solid var(--line);max-height:calc(100vh - 96px);overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--line2) transparent}
+.toc::-webkit-scrollbar{width:3px}
+.toc::-webkit-scrollbar-thumb{background:var(--line2);border-radius:2px}
+.toc-title{font:600 10px "JetBrains Mono";letter-spacing:.22em;text-transform:uppercase;color:var(--faint);margin:0 0 12px;padding:0 2px}
+.toc a{display:flex;align-items:center;gap:8px;padding:5px 7px;border-radius:5px;color:var(--dim);font-size:13px;line-height:1.4;transition:.15s;margin-bottom:1px;min-height:36px}
+.toc a:hover{color:var(--tx);background:rgba(255,255,255,.04)}
+.toc a.active{color:var(--gold);background:rgba(201,162,63,.07)}
+.toc .num{font:600 10px "JetBrains Mono";color:var(--faint);flex:none;width:20px;text-align:right}
+.toc a.active .num{color:var(--gold-d)}
+.toc-div{height:1px;background:var(--line);margin:8px 0}
+
+/* MAIN */
+.main{padding-left:44px;min-width:0}
+
+/* SECTION */
+.sec{padding:52px 0;border-bottom:1px solid var(--line)}
+.sec:last-child{border-bottom:none}
+.sec-hd{display:flex;align-items:center;gap:14px;margin:0 0 24px;flex-wrap:wrap}
+.sec-num{font:700 26px Oswald;color:var(--gold-d);flex:none;min-width:40px}
+.sec-hd h2{font-family:Oswald;font-weight:700;text-transform:uppercase;letter-spacing:.06em;font-size:clamp(18px,2.8vw,26px)}
+.new-badge{font:600 9px "JetBrains Mono";letter-spacing:.1em;text-transform:uppercase;color:#080700;background:var(--gold);border-radius:4px;padding:3px 8px;flex:none}
+.fix-badge{font:600 9px "JetBrains Mono";letter-spacing:.1em;text-transform:uppercase;color:#080700;background:var(--green);border-radius:4px;padding:3px 8px;flex:none}
+
+/* Body text */
+.sec p{color:var(--dim);font-size:15px;line-height:1.7;margin:0}
+.sec p+p{margin-top:8px}
+h3{font-family:Oswald;font-weight:600;text-transform:uppercase;letter-spacing:.05em;font-size:15px;color:var(--tx);margin:24px 0 10px}
+h4{font:600 12px "JetBrains Mono";letter-spacing:.08em;text-transform:uppercase;color:var(--gold);margin:18px 0 6px}
+ul,ol{color:var(--dim);font-size:14px;padding-left:20px;line-height:1.7}
+li{margin-bottom:3px}
+
+/* Steps */
+.steps{display:flex;flex-direction:column;gap:0;margin:16px 0}
+.step{display:flex;gap:14px;position:relative;padding-bottom:22px}
+.step:last-child{padding-bottom:0}
+.step::before{content:"";position:absolute;left:13px;top:28px;bottom:0;width:1px;background:var(--line)}
+.step:last-child::before{display:none}
+.step-n{width:28px;height:28px;border-radius:50%;border:1.5px solid var(--gold-d);display:grid;place-items:center;font:700 11px Oswald;color:var(--gold);flex:none;background:var(--bg);position:relative;z-index:1}
+.step-body{flex:1;padding-top:3px}
+.step-body strong{display:block;font:600 14px Inter;color:var(--tx);margin-bottom:3px}
+.step-body p{font-size:13px;margin:0;color:var(--dim);line-height:1.6}
+
+/* Cards */
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px 20px;margin:12px 0}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:12px 0}
+
+/* Table */
+.tbl-wrap{overflow-x:auto;margin:12px 0;-webkit-overflow-scrolling:touch}
+table{width:100%;border-collapse:collapse;font-size:13px;min-width:400px}
+th{font:600 9px "JetBrains Mono";letter-spacing:.14em;text-transform:uppercase;color:var(--faint);text-align:left;padding:7px 10px;border-bottom:1px solid var(--line)}
+td{padding:8px 10px;border-bottom:1px solid var(--line);color:var(--dim);vertical-align:top}
+td:first-child{color:var(--tx);font-weight:500}
+tr:last-child td{border-bottom:none}
+.td-r{color:#e05a63!important}
+.td-g{color:var(--green)!important}
+.td-b{color:var(--blu)!important}
+
+/* Callouts */
+.note,.warn,.tip{display:flex;gap:10px;padding:12px 14px;border-radius:8px;margin:12px 0;font-size:13px;line-height:1.65;color:var(--dim)}
+.note{background:rgba(90,143,214,.07);border:1px solid rgba(90,143,214,.18)}
+.note::before{content:"ℹ";color:var(--blu);font-size:15px;flex:none}
+.warn{background:rgba(176,30,40,.07);border:1px solid rgba(176,30,40,.2)}
+.warn::before{content:"⚠";color:#e05a63;font-size:15px;flex:none}
+.tip{background:rgba(111,191,115,.07);border:1px solid rgba(111,191,115,.18)}
+.tip::before{content:"✓";color:var(--green);font-size:15px;flex:none}
+
+/* Method cards */
+.method-card{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--gold-d);border-radius:8px;padding:20px 20px;margin:12px 0}
+.method-card.featured{border-left-color:var(--gold)}
+.method-card h4{margin:0 0 8px;color:var(--gold)}
+.method-card p{color:var(--dim);font-size:14px;margin:0 0 10px}
+.method-card ul{color:var(--dim);font-size:13px}
+
+/* Reveal */
+.reveal{opacity:0;transform:translateY(16px);transition:opacity .5s var(--ease),transform .5s var(--ease)}
+.reveal.in{opacity:1;transform:none}
+
+/* FOOTER */
+footer{border-top:1px solid var(--line);padding:24px 20px}
+footer .in{max-width:1400px;margin:0 auto;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px}
+footer .fl{font:600 11px Oswald;letter-spacing:.1em;text-transform:uppercase;color:var(--gold-d)}
+footer .fr{display:flex;gap:16px;flex-wrap:wrap}
+footer .fr a{font:400 13px Inter;color:var(--faint);transition:.15s}
+footer .fr a:hover{color:var(--tx)}
+footer .fc{color:var(--faint);font-size:12px}
+
+/* RESPONSIVE */
+@media(max-width:800px){
+  .layout{grid-template-columns:1fr;padding-top:28px}
+  .toc{position:static;border-right:none;border-bottom:1px solid var(--line);padding:0 0 20px;margin-bottom:28px;max-height:none;display:grid;grid-template-columns:1fr 1fr;gap:2px;align-content:start}
+  .toc-title,.toc-div{grid-column:1/-1}
+  .main{padding-left:0}
+  .cols{grid-template-columns:1fr}
+}
+@media(max-width:600px){
+  .nav-links a:not(.cta){display:none}
+  .logo-txt{display:none}
+  .guide-hero{padding:96px 20px 40px}
+  .sec{padding:40px 0}
+  table{min-width:340px}
+}
+</style>
+</head>
+<body>
+
+<nav class="bar">
+  <div class="in">
+    <div class="logo">
+      <span class="badge-sm">007</span>
+      <span class="logo-txt">First Light Toolkit</span>
+    </div>
+    <div class="spacer"></div>
+    <div class="nav-links">
+      <a href="index.html">Home</a>
+      <a href="source.html">Source</a>
+      <a href="download.html" class="cta">Download</a>
+    </div>
+  </div>
+</nav>
+
+<div class="guide-hero">
+  <div class="inner">
+    <p class="ey">Documentation</p>
+    <h1>FIRST LIGHT TOOLKIT GUIDE</h1>
+    <p>Import, edit, and export 007 First Light game assets — Glacier 2 / KNT Engine · Blender 4.2+</p>
+  </div>
+</div>
+
+<div class="layout">
+
+  <nav class="toc">
+    <p class="toc-title">Contents</p>
+    <a href="#install"><span class="num">01</span> Install</a>
+    <a href="#panel"><span class="num">02</span> The panel</a>
+    <a href="#import"><span class="num">03</span> Import a .prim</a>
+    <a href="#mats"><span class="num">04</span> Materials</a>
+    <a href="#rendermats"><span class="num">05</span> Render materials</a>
+    <a href="#rendersrc"><span class="num">06</span> Render source</a>
+    <a href="#editmats"><span class="num">07</span> Edit a material</a>
+    <a href="#swapmats"><span class="num">08</span> Swap a material</a>
+    <a href="#textools"><span class="num">09</span> Texture tools</a>
+    <a href="#lod"><span class="num">10</span> LOD levels</a>
+    <a href="#editmesh"><span class="num">11</span> Edit the mesh</a>
+    <a href="#export"><span class="num">12</span> Export</a>
+    <a href="#walkthrough"><span class="num">13</span> Walkthrough</a>
+    <a href="#troubleshoot"><span class="num">14</span> Troubleshooting</a>
+    <a href="#reference"><span class="num">15</span> Reference</a>
+    <div class="toc-div"></div>
+    <a href="#custom"><span class="num">16</span> Custom Model Swap</a>
+  </nav>
+
+  <main class="main">
+
+    <section class="sec reveal" id="install">
+      <div class="sec-hd"><span class="sec-num">01</span><h2>Install &amp; First Run</h2></div>
+      <div class="steps">
+        <div class="step"><div class="step-n">1</div><div class="step-body"><strong>Download the .zip</strong><p>Get <code>glacier2_007_toolkit.zip</code> from the <a href="download.html">Download page</a>. Don't extract it.</p></div></div>
+        <div class="step"><div class="step-n">2</div><div class="step-body"><strong>Install in Blender</strong><p>Edit → Preferences → Add-ons → <em>Install from Disk…</em> → select the zip → <em>Install Add-on</em>.</p></div></div>
+        <div class="step"><div class="step-n">3</div><div class="step-body"><strong>Enable</strong><p>Search <em>"Glacier"</em> in the addon list, tick the checkbox, then <em>Save Preferences</em>.</p></div></div>
+        <div class="step"><div class="step-n">4</div><div class="step-body"><strong>Open the panel</strong><p>3D Viewport → <code>N</code> → <strong>Glacier</strong> tab.</p></div></div>
+      </div>
+      <div class="note">Requires Blender 4.2+.</div>
+    </section>
+
+    <section class="sec reveal" id="panel">
+      <div class="sec-hd"><span class="sec-num">02</span><h2>The Panel</h2></div>
+      <p>All toolkit operations live in <strong>N-panel → Glacier</strong>. The panel is context-sensitive — some buttons only appear when a relevant object is selected.</p>
+      <div class="tbl-wrap"><table>
+        <tr><th>Section</th><th>Purpose</th></tr>
+        <tr><td>Import</td><td>Load <code>.prim</code> and <code>.borg</code></td></tr>
+        <tr><td>Materials</td><td>Assign and edit <code>.MATI</code> / <code>.MATB</code></td></tr>
+        <tr><td>Texture Tools</td><td>Decode / encode <code>.TEXT</code> / <code>.TEXD</code></td></tr>
+        <tr><td>Mesh Tools</td><td>Transfer weights, snap shape, make exportable</td></tr>
+        <tr><td>Export</td><td>Write <code>.prim</code>, pack <code>.rpkg</code></td></tr>
+      </table></div>
+    </section>
+
+    <section class="sec reveal" id="import">
+      <div class="sec-hd"><span class="sec-num">03</span><h2>Import a .prim</h2></div>
+      <div class="steps">
+        <div class="step"><div class="step-n">1</div><div class="step-body"><strong>Extract game files</strong><p>Open RPKG-Tool and use the built-in chunk browser (or CLI) to find and extract the <code>.prim</code> and its linked <code>.borg</code> into the same folder.</p></div></div>
+        <div class="step"><div class="step-n">2</div><div class="step-body"><strong>Import</strong><p>Panel → <em>Import Prim</em> → navigate to the <code>.prim</code>. The <code>.borg</code> loads automatically if it's in the same folder.</p></div></div>
+        <div class="step"><div class="step-n">3</div><div class="step-body"><strong>Check the collection</strong><p>A collection named after the <code>.prim</code> appears in the outliner — armature, meshes, and cloth cages.</p></div></div>
+      </div>
+      <h3>Import Options</h3>
+      <div class="tbl-wrap"><table>
+        <tr><th>Option</th><th>Default</th><th>Effect</th></tr>
+        <tr><td>Import LODs</td><td>Off</td><td>Also imports LOD1–LOD3</td></tr>
+        <tr><td>Import Cloth</td><td>On</td><td>Imports cloth cage meshes</td></tr>
+        <tr><td>Auto Apply Material</td><td>On</td><td>Loads and assigns the <code>.MATI</code> on import</td></tr>
+        <tr><td>Load Render Material</td><td>Off</td><td>Builds the Cycles/EEVEE node tree with decoded textures</td></tr>
+      </table></div>
+    </section>
+
+    <section class="sec reveal" id="mats">
+      <div class="sec-hd"><span class="sec-num">04</span><h2>Materials</h2></div>
+      <div class="steps">
+        <div class="step"><div class="step-n">1</div><div class="step-body"><strong>Select the mesh</strong><p>Click the mesh object in the viewport.</p></div></div>
+        <div class="step"><div class="step-n">2</div><div class="step-body"><strong>Load Material</strong><p>Panel → Materials → <em>Load .MATI</em> → navigate to the extracted <code>.MATI</code> file.</p></div></div>
+        <div class="step"><div class="step-n">3</div><div class="step-body"><strong>Apply</strong><p>The material is assigned and texture slots populated from the linked <code>.TEXT</code>/<code>.TEXD</code> files.</p></div></div>
+      </div>
+      <div class="note">Keep all extracted files in the same folder — texture paths are resolved relative to the <code>.MATI</code>.</div>
+    </section>
+
+    <section class="sec reveal" id="rendermats">
+      <div class="sec-hd"><span class="sec-num">05</span><h2>Render Materials</h2></div>
+      <p>Builds a PBR node tree for Cycles or EEVEE — diffuse, normal, SRM, and emissive decoded from <code>.TEXT</code>/<code>.TEXD</code>.</p>
+      <p>Select a mesh with a <code>.MATI</code> loaded → Panel → Materials → <em>Build Render Material</em>.</p>
+      <h3>Texture channels</h3>
+      <div class="tbl-wrap"><table>
+        <tr><th>Slot</th><th>Channels</th><th>Format</th></tr>
+        <tr><td>Diffuse</td><td>RGB + Alpha</td><td>BC1 / BC3</td></tr>
+        <tr><td>Normal</td><td>X → R, Y → G</td><td>BC5</td></tr>
+        <tr><td>SRM</td><td>Spec R, Rough G, Metal B</td><td>BC1 / BC4</td></tr>
+        <tr><td>Emissive</td><td>RGB</td><td>BC1 / BC3</td></tr>
+      </table></div>
+    </section>
+
+    <section class="sec reveal" id="rendersrc">
+      <div class="sec-hd"><span class="sec-num">06</span><h2>Render Source</h2></div>
+      <p>Links a <code>.prim</code> to its source RPKG chunk so the exporter generates correct hash filenames. Set this before exporting.</p>
+      <div class="steps">
+        <div class="step"><div class="step-n">1</div><div class="step-body"><strong>Select the root object</strong><p>Click the armature or root collection object.</p></div></div>
+        <div class="step"><div class="step-n">2</div><div class="step-body"><strong>Set Render Source</strong><p>Panel → Export → <em>Set Render Source</em> → pick the source <code>.rpkg</code> chunk the <code>.prim</code> came from.</p></div></div>
+      </div>
+    </section>
+
+    <section class="sec reveal" id="editmats">
+      <div class="sec-hd"><span class="sec-num">07</span><h2>Edit a Material</h2></div>
+      <div class="steps">
+        <div class="step"><div class="step-n">1</div><div class="step-body"><strong>Open Material Properties</strong><p>Select the mesh → Properties → Material Properties.</p></div></div>
+        <div class="step"><div class="step-n">2</div><div class="step-body"><strong>Swap the image</strong><p>Click the image field in the slot you want to replace and load your new texture (PNG or TGA).</p></div></div>
+        <div class="step"><div class="step-n">3</div><div class="step-body"><strong>Export</strong><p>The exporter encodes your texture to the correct BC format automatically.</p></div></div>
+      </div>
+      <div class="tip">Match the BC format of the original slot — swapping a BC1 diffuse with BC3 adds full alpha support.</div>
+    </section>
+
+    <section class="sec reveal" id="swapmats">
+      <div class="sec-hd"><span class="sec-num">08</span><h2>Swap a Material</h2></div>
+      <p>Replaces which <code>.MATI</code> a mesh references — useful for applying a material from another character or prop.</p>
+      <div class="steps">
+        <div class="step"><div class="step-n">1</div><div class="step-body"><strong>Select the mesh</strong><p>Must have a material loaded via the toolkit.</p></div></div>
+        <div class="step"><div class="step-n">2</div><div class="step-body"><strong>Swap Material</strong><p>Panel → Materials → <em>Swap Material</em> → pick the replacement <code>.MATI</code>.</p></div></div>
+        <div class="step"><div class="step-n">3</div><div class="step-body"><strong>Rebuild render material</strong><p>Run <em>Build Render Material</em> again to update the viewport.</p></div></div>
+      </div>
+    </section>
+
+    <section class="sec reveal" id="textools">
+      <div class="sec-hd"><span class="sec-num">09</span><h2>Texture Tools</h2></div>
+      <h3>Decode to image</h3>
+      <div class="steps">
+        <div class="step"><div class="step-n">1</div><div class="step-body"><strong>Decode Texture</strong><p>Panel → Texture Tools → <em>Decode .TEXT</em> → pick the <code>.TEXT</code> file. The <code>.TEXD</code> loads from the same folder.</p></div></div>
+        <div class="step"><div class="step-n">2</div><div class="step-body"><strong>Result</strong><p>A PNG (or TGA for normal maps) is written next to the source and opened in the Image Editor.</p></div></div>
+      </div>
+      <h3>Encode back</h3>
+      <div class="steps">
+        <div class="step"><div class="step-n">1</div><div class="step-body"><strong>Edit the image</strong><p>Paint or replace the decoded PNG in any image editor.</p></div></div>
+        <div class="step"><div class="step-n">2</div><div class="step-body"><strong>Encode Texture</strong><p>Panel → <em>Encode .TEXT</em> → pick the edited PNG. Writes <code>.TEXT</code> + <code>.TEXD</code> in the correct BC format.</p></div></div>
+      </div>
+      <div class="tbl-wrap"><table>
+        <tr><th>Format</th><th>Used for</th></tr>
+        <tr><td><code>BC1</code></td><td>Opaque diffuse / SRM</td></tr>
+        <tr><td><code>BC3</code></td><td>Diffuse with alpha</td></tr>
+        <tr><td><code>BC4</code></td><td>Single-channel (AO, mask)</td></tr>
+        <tr><td><code>BC5</code></td><td>Normal maps (RG)</td></tr>
+        <tr><td><code>BC7</code></td><td>High-quality diffuse (RGBA)</td></tr>
+      </table></div>
+    </section>
+
+    <section class="sec reveal" id="lod">
+      <div class="sec-hd"><span class="sec-num">10</span><h2>LOD Levels</h2></div>
+      <p>Meshes can have up to four LOD levels (LOD0–LOD3). LOD0 is full detail. Enable <em>Import LODs</em> in the import options to bring in all levels — each is a separate mesh object in the collection.</p>
+      <div class="tip">For a custom mesh swap, editing only LOD0 is usually fine. The game falls back to unmodified lower LODs at distance.</div>
+    </section>
+
+    <section class="sec reveal" id="editmesh">
+      <div class="sec-hd"><span class="sec-num">11</span><h2>Edit the Mesh</h2><span class="fix-badge">UPDATED v2.9.3</span></div>
+
+      <h3>Move existing vertices</h3>
+      <p>Sculpt Mode, Edit Mode, or any modifier that doesn't change vertex count. The exporter byte-patches positions in-place — skin data, bone remap, and aux clusters are copied verbatim from the original. Safest path.</p>
+      <div class="tip">Always use this path for cloth cages — cloth link data is vertex-index based.</div>
+
+      <h3>Custom topology (different vertex count)</h3>
+      <p>Fixed in <strong>v2.9.3</strong>. The all-0xFF bone remap that caused in-game vertex explosions is corrected. See <a href="#custom">§16 Custom Model Swap</a> for the full workflow.</p>
+      <div class="warn">The aux cull-cluster block can't be regenerated. The toolkit writes an empty block (type 0x20). Usually imperceptible for character mods.</div>
+    </section>
+
+    <section class="sec reveal" id="export">
+      <div class="sec-hd"><span class="sec-num">12</span><h2>Export</h2></div>
+      <div class="steps">
+        <div class="step"><div class="step-n">1</div><div class="step-body"><strong>Select the root object</strong><p>Click the armature or root collection object.</p></div></div>
+        <div class="step"><div class="step-n">2</div><div class="step-body"><strong>Set output folder</strong><p>Panel → Export → <em>Output Folder</em>.</p></div></div>
+        <div class="step"><div class="step-n">3</div><div class="step-body"><strong>Configure options</strong><p>Enable <em>Pack RPKG</em> to auto-generate a patch archive. Enable <em>Custom Mesh</em> only if the vertex count changed.</p></div></div>
+        <div class="step"><div class="step-n">4</div><div class="step-body"><strong>Export Prim</strong><p>Panel → <em>Export Prim</em>. Writes <code>.prim</code>, encodes textures, and — if enabled — generates <code>patch_xxx.rpkg</code>.</p></div></div>
+        <div class="step"><div class="step-n">5</div><div class="step-body"><strong>Deploy</strong><p>Copy <code>patch_xxx.rpkg</code> to <code>[Game Install]\Runtime\</code>. Launch the game.</p></div></div>
+      </div>
+      <div class="tbl-wrap"><table>
+        <tr><th>Option</th><th>Default</th><th>Effect</th></tr>
+        <tr><td>Pack RPKG</td><td>Off</td><td>Wraps output into a deployable patch archive</td></tr>
+        <tr><td>Experimental: Custom Mesh</td><td>Off</td><td>Full prim rebuild — required when vertex count changed</td></tr>
+        <tr><td>Export Textures</td><td>On</td><td>Encodes and includes modified textures</td></tr>
+        <tr><td>Export Materials</td><td>On</td><td>Writes modified <code>.MATI</code> files</td></tr>
+      </table></div>
+    </section>
+
+    <section class="sec reveal" id="walkthrough">
+      <div class="sec-hd"><span class="sec-num">13</span><h2>Full Walkthrough</h2></div>
+      <p>End-to-end: replace a character mesh and export a deployable patch.</p>
+      <div class="steps">
+        <div class="step"><div class="step-n">1</div><div class="step-body"><strong>Extract</strong><p>RPKG-Tool → use the built-in chunk browser or CLI to find and extract the <code>.prim</code>, <code>.borg</code>, <code>.MATI</code>, and textures to a work folder.</p></div></div>
+        <div class="step"><div class="step-n">2</div><div class="step-body"><strong>Import</strong><p>Panel → <em>Import Prim</em>. Enable <em>Load Render Material</em> to see the textured result in the viewport.</p></div></div>
+        <div class="step"><div class="step-n">3</div><div class="step-body"><strong>Edit</strong><p>Sculpt / reshape the mesh, or follow <a href="#custom">§16</a> to swap in a custom model.</p></div></div>
+        <div class="step"><div class="step-n">4</div><div class="step-body"><strong>Edit textures (optional)</strong><p>Decode a <code>.TEXT</code>, repaint in any editor, encode back.</p></div></div>
+        <div class="step"><div class="step-n">5</div><div class="step-body"><strong>Set Render Source</strong><p>Armature selected → Panel → Export → <em>Set Render Source</em> → pick the original <code>.rpkg</code> chunk.</p></div></div>
+        <div class="step"><div class="step-n">6</div><div class="step-body"><strong>Export</strong><p>Enable <em>Pack RPKG</em> → <em>Export Prim</em>.</p></div></div>
+        <div class="step"><div class="step-n">7</div><div class="step-body"><strong>Deploy</strong><p>Copy <code>patch_xxx.rpkg</code> to <code>[Game]\Runtime\</code> and launch.</p></div></div>
+      </div>
+    </section>
+
+    <section class="sec reveal" id="troubleshoot">
+      <div class="sec-hd"><span class="sec-num">14</span><h2>Troubleshooting</h2></div>
+
+      <h3>Import</h3>
+      <div class="tbl-wrap"><table>
+        <tr><th>Symptom</th><th>Fix</th></tr>
+        <tr><td>Skeleton not imported</td><td>Extract the <code>.borg</code> alongside the <code>.prim</code></td></tr>
+        <tr><td>Textures show as pink</td><td>Extract <code>.TEXT</code>/<code>.TEXD</code> into the same folder as the <code>.MATI</code></td></tr>
+        <tr><td>Collection is empty</td><td>Make sure you're pointing at a <code>.prim</code>, not a <code>.borg</code></td></tr>
+      </table></div>
+
+      <h3>Export</h3>
+      <div class="tbl-wrap"><table>
+        <tr><th>Symptom</th><th>Fix</th></tr>
+        <tr><td>Game crashes on load</td><td>The patch <code>.rpkg</code> must be in <code>[Game]\Runtime\</code> — not a subfolder</td></tr>
+        <tr><td>Mesh invisible in-game</td><td>Set Render Source before exporting</td></tr>
+        <tr><td>Custom rebuild failed</td><td>Run <em>Transfer Weights to Selected</em> before <em>Make Custom Mesh Exportable</em></td></tr>
+        <tr><td>RPKG packer not found</td><td>Re-install from the latest zip — native DLLs are included</td></tr>
+      </table></div>
+
+      <h3>Custom mesh</h3>
+      <div class="tbl-wrap"><table>
+        <tr><th>Symptom</th><th>Fix</th></tr>
+        <tr><td class="td-g">Skinned mesh exploded (pre v2.9.3)</td><td class="td-g">Update to v2.9.3 — bone-remap bug is fixed</td></tr>
+        <tr><td>Weights look wrong after transfer</td><td>Move your mesh to overlap the game mesh before transferring, then move it back</td></tr>
+        <tr><td>Cloth breaks after mesh swap</td><td>Keep cloth cage vertex count identical; only move existing vertices</td></tr>
+        <tr><td>UVs distorted after Snap</td><td>Enable <em>Transfer UVs from Custom Mesh</em> in the Snap operator options</td></tr>
+      </table></div>
+    </section>
+
+    <section class="sec reveal" id="reference">
+      <div class="sec-hd"><span class="sec-num">15</span><h2>Reference</h2></div>
+      <h3>File types</h3>
+      <div class="tbl-wrap"><table>
+        <tr><th>Extension</th><th>Contents</th></tr>
+        <tr><td><code>.prim</code></td><td>Vertices, normals, UVs, skin weights, LODs, cloth cages</td></tr>
+        <tr><td><code>.borg</code></td><td>Bone hierarchy, bind poses, cloth rig</td></tr>
+        <tr><td><code>.MATI</code></td><td>Material instance — texture bindings and shader class</td></tr>
+        <tr><td><code>.MATB</code></td><td>Shader class definition</td></tr>
+        <tr><td><code>.TEXT</code></td><td>Texture header — format, dimensions, mip count</td></tr>
+        <tr><td><code>.TEXD</code></td><td>BCn-compressed pixel data</td></tr>
+        <tr><td><code>.rpkg</code></td><td>Package archive — patch archives replace originals at load</td></tr>
+      </table></div>
+      <h3>Version history</h3>
+      <div class="tbl-wrap"><table>
+        <tr><th>Version</th><th>Changes</th></tr>
+        <tr><td><strong>2.9.3</strong></td><td>Fixed bone-remap explosion bug. Added Snap Game Mesh to Custom Shape operator.</td></tr>
+        <tr><td>2.8.0</td><td>Fixed null-pointer crash from missing aux cull-cluster block on custom topology exports.</td></tr>
+        <tr><td>2.7.x</td><td>RPKG packer integrated into the export panel.</td></tr>
+        <tr><td>2.6.x</td><td>Cloth import / export added.</td></tr>
+      </table></div>
+    </section>
+
+    <section class="sec reveal" id="custom">
+      <div class="sec-hd"><span class="sec-num">16</span><h2>Custom Model Swap</h2><span class="new-badge">v2.9.3</span></div>
+      <p>Replace a game mesh with your own model — different topology, different vertex count — and get it in-game with rigging and UVs intact.</p>
+
+      <h3>Method A — Custom Topology</h3>
+      <p>Use when your mesh has a <strong>different vertex count</strong>. Triggers a full PRIM rebuild. Fixed in v2.9.3.</p>
+      <div class="method-card featured">
+        <h4>Steps</h4>
+        <div class="steps">
+          <div class="step"><div class="step-n">1</div><div class="step-body"><strong>Import game prim</strong><p>Panel → <em>Import Prim</em>.</p></div></div>
+          <div class="step"><div class="step-n">2</div><div class="step-body"><strong>Import your model</strong><p>File → Import (OBJ, FBX, etc.). Position it to overlap the game mesh.</p></div></div>
+          <div class="step"><div class="step-n">3</div><div class="step-body"><strong>Transfer Weights</strong><p>Select your mesh → shift-click the game mesh (active) → Panel → <em>Transfer Weights to Selected</em>.</p></div></div>
+          <div class="step"><div class="step-n">4</div><div class="step-body"><strong>Make Exportable</strong><p>Select your mesh → Panel → <em>Make Custom Mesh Exportable</em>.</p></div></div>
+          <div class="step"><div class="step-n">5</div><div class="step-body"><strong>Export</strong><p>Hide / delete the original game mesh → Panel → Export → enable <em>Experimental: Custom Mesh</em> → <em>Export Prim</em>.</p></div></div>
+        </div>
+      </div>
+
+      <h3>Method B — Snap to Game Slot</h3>
+      <p>Use when you want your custom shape but need to keep the <strong>original vertex count</strong>. Shrinkwrap projects the game mesh's verts onto your custom surface. Rigging stays completely untouched.</p>
+      <div class="method-card">
+        <h4>Steps</h4>
+        <div class="steps">
+          <div class="step"><div class="step-n">1</div><div class="step-body"><strong>Import game prim</strong><p>Panel → <em>Import Prim</em>.</p></div></div>
+          <div class="step"><div class="step-n">2</div><div class="step-body"><strong>Import your model</strong><p>Scale and position it to match the game mesh proportionally.</p></div></div>
+          <div class="step"><div class="step-n">3</div><div class="step-body"><strong>Selection order matters</strong><p>Click your <strong>custom mesh first</strong> → shift-click the <strong>game mesh</strong> (active).</p></div></div>
+          <div class="step"><div class="step-n">4</div><div class="step-body"><strong>Snap Game Mesh to Custom Shape</strong><p>Panel → Mesh Tools → <em>Snap Game Mesh to Custom Shape</em>. Enable <em>Transfer UVs</em> if you want your custom UVs.</p></div></div>
+          <div class="step"><div class="step-n">5</div><div class="step-body"><strong>Make Exportable</strong><p>Panel → <em>Make Custom Mesh Exportable</em>.</p></div></div>
+          <div class="step"><div class="step-n">6</div><div class="step-body"><strong>Export normally</strong><p>No Custom Mesh flag needed — vertex count is unchanged. Panel → <em>Export Prim</em>.</p></div></div>
+        </div>
+      </div>
+      <div class="tip">Method B runs the safe-path byte-patcher — skin partition, BoneInfo, BoneIndices, and aux cluster are all copied verbatim from the original.</div>
+
+      <h3>Comparison</h3>
+      <div class="tbl-wrap"><table>
+        <tr><th></th><th>Method A</th><th>Method B</th></tr>
+        <tr><td>Vertex count</td><td>Any</td><td>Same as original</td></tr>
+        <tr><td>Rigging</td><td>Transferred</td><td>Original — untouched</td></tr>
+        <tr><td>UV</td><td>Custom UVs</td><td>Original or transferred</td></tr>
+        <tr><td>Cloth</td><td class="td-r">Dropped</td><td class="td-g">Intact</td></tr>
+        <tr><td>Aux clusters</td><td class="td-r">Empty block</td><td class="td-g">Original kept</td></tr>
+      </table></div>
+
+      <h3>Troubleshooting</h3>
+      <div class="tbl-wrap"><table>
+        <tr><th>Symptom</th><th>Fix</th></tr>
+        <tr><td>Still exploding after v2.9.3</td><td>Re-run Transfer Weights and Make Exportable — old metadata may have carried over</td></tr>
+        <tr><td>Snap result is lumpy</td><td>Your custom model needs more polygons near the game mesh's silhouette edges</td></tr>
+        <tr><td>UVs garbled after Snap</td><td>Enable <em>Transfer UVs from Custom Mesh</em> in the operator options panel (bottom-left after clicking)</td></tr>
+        <tr><td>Weights all zero</td><td>Meshes were too far apart during transfer — overlap them, transfer, then move back</td></tr>
+      </table></div>
+    </section>
+
+  </main>
+</div>
+
+<footer>
+  <div class="in">
+    <span class="fl">007 First Light Toolkit</span>
+    <span class="fc">v2.9.3 · Blender 4.2+</span>
+    <div class="fr">
+      <a href="index.html">Home</a>
+      <a href="source.html">Source</a>
+      <a href="download.html">Download</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+const secs=document.querySelectorAll('.sec');
+const links=document.querySelectorAll('.toc a');
+const io=new IntersectionObserver(e=>{
+  e.forEach(x=>{
+    if(x.isIntersecting){
+      links.forEach(l=>l.classList.remove('active'));
+      const a=document.querySelector(`.toc a[href="#${x.target.id}"]`);
+      if(a)a.classList.add('active');
+    }
+  });
+},{rootMargin:'-20% 0px -70% 0px'});
+secs.forEach(s=>io.observe(s));
+
+const rev=new IntersectionObserver(e=>{e.forEach(x=>{if(x.isIntersecting){x.target.classList.add('in');rev.unobserve(x.target)}})},{threshold:.08});
+document.querySelectorAll('.reveal').forEach(el=>rev.observe(el));
+
+document.querySelectorAll('.toc a').forEach(a=>{
+  a.addEventListener('click',e=>{
+    e.preventDefault();
+    const el=document.getElementById(a.getAttribute('href').slice(1));
+    if(el)el.scrollIntoView({behavior:'smooth',block:'start'});
+  });
+});
+</script>
+</body>
+</html>
