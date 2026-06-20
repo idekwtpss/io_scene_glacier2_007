@@ -110,7 +110,7 @@ section{padding:80px 24px}
 .cta-ey{font:600 11px "JetBrains Mono";letter-spacing:.22em;text-transform:uppercase;color:var(--gold);margin:0 0 20px;display:flex;align-items:center;justify-content:center;gap:14px}
 .cta-ey::before,.cta-ey::after{content:"";display:block;width:40px;height:1px;background:var(--gold-d)}
 .cta-sec h2{font-family:Oswald;font-weight:700;text-transform:uppercase;letter-spacing:.08em;font-size:clamp(26px,5.5vw,56px);margin:0 0 12px}
-.cta-sec p{color:var(--dim);max-width:440px;margin:0 auto 40px;font-size:15px;line-height:1.7}
+.cta-sec p{color:var(--dim);max-width:440px;margin:0 auto 22px;font-size:15px;line-height:1.7}
 .cta-meta{margin-top:20px;font:500 11px "JetBrains Mono";letter-spacing:.12em;color:var(--faint);text-transform:uppercase}
 .cta-meta span{color:var(--line2);margin:0 8px}
 
@@ -261,10 +261,44 @@ footer .fc{color:var(--faint);font-size:12px}
     <h2 class="stitle reveal">EXTRACT · IMPORT · EDIT · EXPORT</h2>
     <p class="ssub reveal">Same four steps every time. The toolkit covers each one inside Blender.</p>
     <div class="wf-steps">
-      <div class="wf reveal" data-d="1"><div class="wf-n">01</div><h4>Extract</h4><p>RPKG-Tool pulls <code>.prim</code>, <code>.borg</code>, <code>.MATI</code>, and textures from the game's chunk archives.</p></div>
+      <div class="wf reveal" data-d="1"><div class="wf-n">01</div><h4>Extract</h4><p>Open RPKG-Tool, use the built-in chunk browser or CLI to find and extract <code>.prim</code>, <code>.borg</code>, and texture files.</p></div>
       <div class="wf reveal" data-d="2"><div class="wf-n">02</div><h4>Import</h4><p>Load the files into Blender. Auto-Apply builds the full render material on import.</p></div>
       <div class="wf reveal" data-d="3"><div class="wf-n">03</div><h4>Edit</h4><p>Reshape the mesh, repaint textures, swap materials, or replace the model entirely.</p></div>
       <div class="wf reveal" data-d="4"><div class="wf-n">04</div><h4>Export &amp; Pack</h4><p>Write the <code>.prim</code>, then pack into a patch <code>.rpkg</code> from the sidebar.</p></div>
+    </div>
+  </div>
+</section>
+
+<div class="gline"></div>
+
+<!-- MOD SHOWCASE -->
+<section>
+  <div class="wrap">
+    <div class="spot">
+      <div class="reveal-l">
+        <div class="spot-label">WHAT IT'S ACTUALLY FOR</div>
+        <h2>RESHAPE ANY MODEL</h2>
+        <p>The core purpose is letting you reshape, sculpt, and replace 007 First Light game meshes inside Blender — then get them running in-game. No hex editors, no manual binary work.</p>
+        <p style="margin-top:10px">Here's a real character model mod built entirely with this workflow:</p>
+        <div style="display:flex;gap:10px;margin-top:24px;flex-wrap:wrap">
+          <a href="https://www.nexusmods.com/007firstlight/mods/122" target="_blank" rel="noopener" class="btn-g">View Mod on NexusMods</a>
+          <a href="guide.html" class="btn-o">How it works</a>
+        </div>
+      </div>
+      <div class="methods reveal-r">
+        <div class="method">
+          <h5>Reshape in Sculpt Mode</h5>
+          <p>Import the game mesh, sculpt directly in Blender's Sculpt Mode, export. Weights and cloth stay intact.</p>
+        </div>
+        <div class="method">
+          <h5>Swap in Custom Models</h5>
+          <p>Bring in any mesh — different topology, different vertex count. Transfer the rig and export with one click.</p>
+        </div>
+        <div class="method">
+          <h5>See it in-game in minutes</h5>
+          <p>The built-in RPKG packer drops a patch archive straight into the game's Runtime folder. No external tools mid-flow.</p>
+        </div>
+      </div>
     </div>
   </div>
 </section>
