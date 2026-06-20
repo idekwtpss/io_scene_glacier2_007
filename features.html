@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -110,6 +110,20 @@ summary.gs::marker{display:none}
 .enc-opt{background:var(--bg2);border:1px solid var(--line);border-radius:7px;padding:10px 12px}
 .enc-opt h5{font:700 11px "JetBrains Mono";letter-spacing:.08em;color:var(--gold);margin:0 0 4px}
 .enc-opt p{font-size:12px;color:var(--dim);margin:0;line-height:1.5}
+
+/* WIP / ISSUES */
+.wip-tag{font:700 9px "JetBrains Mono";letter-spacing:.1em;text-transform:uppercase;color:#d4891a;background:rgba(212,137,26,.09);border:1px solid rgba(212,137,26,.24);border-radius:4px;padding:2px 7px;flex:none;white-space:nowrap}
+.issues-btn{font:600 11px Inter;color:var(--dim);background:transparent;border:1px solid var(--line2);border-radius:5px;padding:3px 9px;cursor:pointer;flex:none;white-space:nowrap;transition:.15s;line-height:1;min-height:28px;display:flex;align-items:center;gap:5px}
+.issues-btn:hover{color:#e05a63;border-color:rgba(176,30,40,.4);background:rgba(176,30,40,.06)}
+.issues-btn .ib-chev{width:11px;height:11px;transition:transform .2s var(--ease)}
+.issues-btn.open .ib-chev{transform:rotate(180deg)}
+.issues-panel{display:none;margin:2px 0 6px;padding:12px 14px;background:rgba(176,30,40,.05);border:1px solid rgba(176,30,40,.18);border-left:3px solid rgba(176,30,40,.5);border-radius:0 7px 7px 0}
+.issues-panel.open{display:block;animation:iSlide .2s var(--ease)}
+.issues-panel h5{font:700 10px "JetBrains Mono";letter-spacing:.14em;text-transform:uppercase;color:#e05a63;margin:0 0 9px}
+.issues-panel ul{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:7px}
+.issues-panel li{font-size:13px;color:var(--dim);padding-left:16px;position:relative;line-height:1.6}
+.issues-panel li::before{content:"▸";color:#c05060;position:absolute;left:1px;font-size:10px;top:2px}
+@keyframes iSlide{from{opacity:0;transform:translateY(-5px)}to{opacity:1;transform:none}}
 
 /* REVEAL */
 .cat-block{opacity:0;transform:translateY(16px);transition:opacity .5s var(--ease),transform .5s var(--ease)}
@@ -423,6 +437,11 @@ footer .fc{color:var(--faint);font-size:12px}
             <h3>Reshape a mesh safely</h3>
             <p>Edit vertex positions without breaking skinned meshes or causing in-game crashes.</p>
           </div>
+          <span class="wip-tag">WIP</span>
+          <button class="issues-btn" data-issues="issues-msh">
+            <svg class="ib-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 6l4 4 4-4"/></svg>
+            Issues
+          </button>
           <svg class="gc-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 6l4 4 4-4"/></svg>
         </summary>
         <div class="gc-body"><div class="gc-body-inner">
@@ -437,6 +456,46 @@ footer .fc{color:var(--faint);font-size:12px}
             <div class="step"><div class="step-n">4</div><div class="step-body"><strong>Export normally</strong><p>The addon byte-patches positions in-place, preserving all weights and bone data.</p></div></div>
           </div>
           <div class="warn">Changing vertex count on skinned meshes (heads, bodies) causes in-game explosions. Only enable <strong>Experimental: Custom Mesh</strong> if you know what you're doing — see the <a href="guide.html#custom">Custom Model Swap guide</a>.</div>
+        </div></div>
+      </details>
+      <div class="issues-panel" id="issues-msh">
+        <h5>Known Issues</h5>
+        <ul>
+          <li><strong>Custom Mesh — aux cluster block</strong>: When changing vertex count, LOD cull clusters can't be regenerated from scratch. This may cause incorrect culling or rendering in some scenes. Use the safe reshape workflow (same vertex count) wherever possible.</li>
+          <li><strong>Cloth data dropped on replacement</strong>: If the replaced mesh had cloth simulation data, it's removed to prevent crashes. Cloth physics will be lost on the output file.</li>
+          <li><strong>Experimental path still unstable</strong>: The custom mesh importer (changed vertex count path) has edge cases that can produce unexpected in-game results. See the <a href="guide.html#custom">guide</a> for the current recommended workarounds.</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════════ WORKFLOWS ═══ -->
+    <div class="cat-block">
+      <div class="cat-hd">
+        <span class="cat-name">Workflows</span>
+        <span class="cat-n">1 guide</span>
+      </div>
+
+      <details class="gc">
+        <summary class="gs">
+          <span class="gc-code">WRK</span>
+          <div class="gc-info">
+            <h3>Reshape a model in-place</h3>
+            <p>The safest full workflow — sculpt or move geometry without touching vertex count.</p>
+          </div>
+          <svg class="gc-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 6l4 4 4-4"/></svg>
+        </summary>
+        <div class="gc-body"><div class="gc-body-inner">
+          <div class="note">This path avoids the experimental custom mesh importer entirely. Vertex count stays identical to the original, so export is 100% stable.</div>
+          <div class="steps">
+            <div class="step"><div class="step-n">1</div><div class="step-body"><strong>Import the .prim</strong><p>Open <em>Import / Export → Import Model</em> and select your <code>.prim</code> file.</p></div></div>
+            <div class="step"><div class="step-n">2</div><div class="step-body"><strong>Disable Embed Skeleton Reference</strong><p>In the import options, turn <strong>Embed Skeleton Reference off</strong> before importing. Leaving it on can cause issues when re-exporting mesh-only edits.</p></div></div>
+            <div class="step"><div class="step-n">3</div><div class="step-body"><strong>Reshape in Edit Mode or Sculpt Mode</strong><p>Move, grab, or sculpt vertices as needed. You can reshape freely — <strong>do not add or remove vertices</strong>. Skin weights and bone data are untouched.</p></div></div>
+            <div class="step"><div class="step-n">4</div><div class="step-body"><strong>Open Export Model + Edits</strong><p>Go to <em>Import / Export → Export Model + Edits</em>.</p></div></div>
+            <div class="step"><div class="step-n">5</div><div class="step-body"><strong>Select the Mesh Edits Only preset</strong><p>Choose the <strong>Mesh Edits Only</strong> export preset. This writes only the changed geometry and skips material and texture output.</p></div></div>
+            <div class="step"><div class="step-n">6</div><div class="step-body"><strong>Enable Propagate LOD Edits</strong><p>Turn <strong>Propagate LOD Edits on</strong>. This applies your vertex changes to all lower LOD levels automatically — without it, only LOD 0 is updated.</p></div></div>
+            <div class="step"><div class="step-n">7</div><div class="step-body"><strong>Set output folder and export</strong><p>Pick a destination folder outside the game install and run the export. Drop the output <code>.prim</code> into your mod package.</p></div></div>
+          </div>
+          <div class="warn">Do not add or remove vertices at any point. The custom mesh path is still experimental and can produce unstable results — this workflow deliberately stays on the safe byte-patch path.</div>
         </div></div>
       </details>
     </div>
@@ -515,6 +574,18 @@ document.querySelectorAll('details.gc').forEach(d=>{
     if(d.open){
       document.querySelectorAll('details.gc').forEach(o=>{if(o!==d)o.removeAttribute('open')});
     }
+  });
+});
+
+// Issues button — toggle panel without triggering accordion
+document.querySelectorAll('.issues-btn').forEach(btn=>{
+  btn.addEventListener('click',e=>{
+    e.stopPropagation();
+    e.preventDefault();
+    const panel=document.getElementById(btn.dataset.issues);
+    if(!panel)return;
+    const open=panel.classList.toggle('open');
+    btn.classList.toggle('open',open);
   });
 });
 </script>
