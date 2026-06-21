@@ -19,7 +19,7 @@ bl_info = {
         "material-name resolution from IOI paths. This NATIVE build can additionally "
         "drive RPKG-Tool's rpkg-lib.dll for extraction (opt-in, self-verified)."),
     "author": "Glacier modding community",
-    "version": (2, 9, 3),
+    "version": (2, 9, 4),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > 007 Mesh Tools  •  File > Import/Export > Glacier 2 007",
     "category": "Import-Export",
@@ -861,6 +861,11 @@ def build_armature_object(context, collection, borg, name, reorient=False):
         pb.rotation_quaternion = ern.conjugated() @ r @ er.conjugated() @ ern
         pb.scale = s
 
+    # Store BORG bone-index → Blender-bone-name mapping for MJBA import.
+    arma_obj["glacier_borg_bone_names"] = [
+        bones[i].bl_name for i in range(len(borg.bone_definitions))
+    ]
+
     return arma_obj
 
 
@@ -1462,12 +1467,29 @@ def walk_prim_objects(data):
     objs = []
     for k in range(count):
         off = u32(table_off + k * 4)
+        sub_type = data[off + 4]
+        nv = u32(off + 44)
+        vbo = u32(off + 48)
+        aux = u32(off + 64)           # aux_offset
+        cloth = u32(off + 68)         # cloth_data_offset (nonzero = cloth/hair)
+        # UV channel count. Subtype 3/4/5 advertise 2/3/4 channels directly; for
+        # weighted (sub 2) meshes, derive it from the NTB+UV region size:
+        #   region = pos(8N) + skin(8N) + (12 NTB + 4*uvc UV)*N  -> per-vert = 32 + 4*uvc
+        uvc = {3: 2, 4: 3, 5: 4}.get(sub_type, 1)
+        region_end = cloth or aux
+        if weighted and nv and region_end > vbo:
+            u = int(round(((region_end - vbo) / nv - 32) / 4.0))
+            if 1 <= u <= 4:
+                uvc = u
         objs.append({
             "off": off,
-            "sub_type": data[off + 4],
-            "num_vertices": u32(off + 44),
-            "vbo": u32(off + 48),
+            "sub_type": sub_type,
+            "num_vertices": nv,
+            "vbo": vbo,
             "num_indices": u32(off + 52),
+            "aux_offset": aux,
+            "cloth_data_offset": cloth,
+            "uvc": uvc,
             "pos_scale_off": off + 72,
             "pos_bias_off": off + 88,
         })
@@ -1490,15 +1512,16 @@ def patch_object(data, meta, coords, normals):
     struct.pack_into("<fff", data, meta["pos_bias_off"], bias[0], bias[1], bias[2])
 
     if normals is not None:
-        def _a16(x): return (x + 15) & ~15
+        # The vertex buffer is TIGHTLY packed (no 16-byte inter-stream padding).
+        # Each NTB+UV record is 12 NTB bytes + 4*uvc UV bytes; the normal is the
+        # first 4 bytes of that record. uvc=1 for most meshes, but hair carries 2
+        # UV channels (20-byte records) — a hardcoded stride of 16 corrupts UVs.
         sub = meta["sub_type"]
-        if sub == 2:            # weighted: positions(8N) [align] subA(8N) [align] NTB+UV(16)
-            suba_start = _a16(vbo + n * 8)
-            nrm_base = _a16(suba_start + n * 8)
-            stride = 16
-        elif sub in (0, 1):     # linked/standard: positions(8N) [align] NTB+UV(16)
-            nrm_base = _a16(vbo + n * 8)
-            stride = 16
+        stride = 12 + 4 * int(meta.get("uvc", 1))
+        if sub == 2:            # weighted: pos(8N) + skin(8N) + NTB+UV(stride*N)
+            nrm_base = vbo + n * 16
+        elif sub in (0, 1):     # unweighted: pos(8N) + NTB+UV(stride*N)
+            nrm_base = vbo + n * 8
         else:
             return
         for i in range(n):
@@ -1514,14 +1537,14 @@ def _color_stream_offset(meta):
     """Byte offset of the per-vertex colour stream (4 bytes/vert) for one object,
     or None if the layout has no colour stream room."""
     vbo = meta["vbo"]; n = meta["num_vertices"]; sub = meta.get("sub_type", 2)
-    def _a16(x): return (x + 15) & ~15
+    rec = 12 + 4 * int(meta.get("uvc", 1))   # NTB+UV record stride (tight)
     if sub == 2:
-        nrm = _a16(_a16(vbo + n * 8) + n * 8)
+        nrm = vbo + n * 16                   # pos(8N) + skin(8N)
     elif sub in (0, 1):
-        nrm = _a16(vbo + n * 8)
+        nrm = vbo + n * 8                    # pos(8N)
     else:
         return None
-    return _a16(nrm + n * 16)
+    return nrm + n * rec                     # colour stream follows NTB+UV region
 
 
 def patch_object_colors(data, meta, colors):
@@ -13790,6 +13813,355 @@ class GLACIER_OT_anmc_clear_info(bpy.types.Operator):
         return {"FINISHED"}
 
 
+# =============================================================================
+# MJBA — 007 First Light native animation reader
+# Adapted from Noesis C++ plugin (Source.cpp / Utils.h).
+# Credits: 2kpr for MJBA layout notes; plugin author for the decompressor.
+# =============================================================================
+
+def _mjba_c64(v):
+    """Simulate C++ int64_t overflow / arithmetic right-shift semantics."""
+    v &= 0xFFFFFFFFFFFFFFFF
+    return v - 0x10000000000000000 if v >= 0x8000000000000000 else v
+
+
+def _mjba_decomp_quat(buf, offs):
+    """Decode 8 bytes → 4 × uint16 quaternion.  Stored in reverse order
+    (q[3-i] = decode) per the C++ source."""
+    q = [0.0] * 4
+    for i in range(4):
+        u = struct.unpack_from('<H', buf, offs + i * 2)[0]
+        q[3 - i] = u * 2.0 / 65535.0 - 1.0
+    return q, offs + 8
+
+
+def _mjba_decomp_pos(buf, offs, scale):
+    """Decode 8 bytes → 3 × 21-bit signed int position.
+    Returns [1.0, Z*sz, Y*sy, X*sx] matching C++ RichVec4 layout before
+    the std::reverse the caller applies."""
+    val = struct.unpack_from('<q', buf, offs)[0]      # signed int64
+    x = float(_mjba_c64(val * 2)    >> 43) * scale[0]
+    y = float(_mjba_c64(val << 22)  >> 43) * scale[1]
+    z = float(_mjba_c64(val << 43)  >> 43) * scale[2]
+    return [1.0, z, y, x], offs + 8                  # [w_placeholder, z, y, x]
+
+
+def _sv_shu(v, f):
+    """SIMD shuffle (Utils.h simdv::shu)."""
+    x, y, z, w = v
+    if f == 0x1B: return [w, z, y, x]
+    if f == 0xB1: return [y, x, w, z]
+    if f == 0xD2: return [x, z, w, y]
+    if f == 0x2D: return [w, y, x, z]
+    return list(v)
+
+def _sv_mul(a, b): return [a[i] * b[i] for i in range(4)]
+def _sv_add(a, b): return [a[i] + b[i] for i in range(4)]
+def _sv_sub(a, b): return [a[i] - b[i] for i in range(4)]
+
+
+def _mjba_decomp_all(quat, pos, quatA, quatB, posA):
+    """Bind-pose retargeting — faithful transliteration of Utils.h decompAll.
+    All args are [x,y,z,w] lists; quat and pos are modified in-place."""
+    negatew   = [-1.0,  1.0,  1.0,  1.0]
+    negatexyz = [ 1.0, -1.0, -1.0, -1.0]
+    x = [None] * 12
+
+    x[9]  = list(quatA);  x[11] = list(quat);   x[7]  = list(quatB)
+    x[5]  = list(negatexyz);  x[8]  = list(x[7])
+    x[6]  = list(pos);    x[6][0] = 0.0
+    x[1]  = _sv_shu(x[6], 0xD2)
+    x[6]  = _sv_shu(x[6], 0x2D)
+    x[2]  = list(x[1])
+    x[5]  = _sv_mul(x[5], x[7]);  x[2] = _sv_mul(x[2], x[7])
+    x[8]  = _sv_shu(x[7], 0x1B)
+    x[4]  = _sv_mul(list(x[8]), x[1])
+    _s5   = list(x[5])
+    x[1]  = _sv_shu(_s5, 0xD2);   x[5] = _sv_shu(_s5, 0x2D)
+    x[0]  = list(x[6])
+    x[6]  = _sv_mul(x[6], x[7]);  x[0] = _sv_mul(x[0], x[8])
+    x[4]  = _sv_add(x[4], x[6]);  x[6] = list(negatew)
+    x[0]  = _sv_sub(x[0], x[2]);  x[4] = _sv_shu(x[4], 0xB1)
+    x[2]  = list(x[1]);           x[4] = _sv_add(x[4], x[0])
+    x[0]  = list(x[5]);           x[4] = _sv_shu(x[4], 0xD2)
+    x[4]  = _sv_mul(x[4], x[6]);  x[5] = _sv_mul(x[5], x[4])
+    x[2]  = _sv_mul(x[2], x[4])
+    x[3]  = _sv_shu(x[4], 0x1B)
+    x[0]  = _sv_mul(x[0], x[3])
+    x[3]  = _sv_mul(list(x[3]), x[1])
+    x[3]  = _sv_add(x[3], x[5]);  x[0] = _sv_sub(x[0], x[2])
+    x[3]  = _sv_shu(x[3], 0xB1);  x[3] = _sv_add(x[3], x[0])
+    x[3]  = _sv_shu(x[3], 0xD2)
+    _s11  = list(x[11])
+    x[0]  = _sv_shu(_s11, 0xD2);  x[11] = _sv_shu(_s11, 0x2D)
+    x[3]  = _sv_mul(x[3], x[6]);  x[3]  = _sv_add(x[3], list(posA))
+    x[2]  = list(x[0]);           x[1]  = list(x[11])
+    x[1]  = _sv_mul(x[1], x[8]);  x[8]  = _sv_mul(list(x[8]), x[0])
+    x[2]  = _sv_mul(x[2], x[7])
+    pos[:] = x[3]
+
+    x[1]  = _sv_sub(x[1], x[2])
+    x[11] = _sv_mul(list(x[11]), x[7])
+    x[8]  = _sv_add(x[8], x[11])
+    x[8]  = _sv_shu(x[8], 0xB1);  x[8] = _sv_add(x[8], x[1])
+    _s9   = list(x[9])
+    x[1]  = _sv_shu(_s9, 0xD2);   x[9] = _sv_shu(_s9, 0x2D)
+    x[0]  = list(x[9]);           x[2] = list(x[1])
+    x[8]  = _sv_shu(x[8], 0xD2);  x[8] = _sv_mul(x[8], x[6])
+    x[9]  = _sv_mul(list(x[9]), x[8]);  x[2] = _sv_mul(x[2], x[8])
+    x[3]  = _sv_shu(x[8], 0x1B)
+    x[0]  = _sv_mul(x[0], x[3]);  x[3] = _sv_mul(list(x[3]), x[1])
+    x[3]  = _sv_add(x[3], x[9]);  x[0] = _sv_sub(x[0], x[2])
+    x[3]  = _sv_shu(x[3], 0xB1);  x[3] = _sv_add(x[3], x[0])
+    x[3]  = _sv_shu(x[3], 0xD2);  x[3] = _sv_mul(x[3], x[6])
+    quat[:] = x[3]
+
+
+def _mjba_parse(filepath):
+    """Parse a .MJBA animation file. Returns:
+    {
+        "fps": float, "frame_count": int, "mrtr_bone_count": int,
+        "tracks": {bone_idx: {"rot": [[q0,q1,q2,q3],...], "pos": [[x,y,z],...]}}
+    }"""
+    with open(filepath, "rb") as fh:
+        buf = fh.read()
+
+    def u8(o):  return buf[o]
+    def u16(o): return struct.unpack_from('<H', buf, o)[0]
+    def u32(o): return struct.unpack_from('<I', buf, o)[0]
+    def f32(o): return struct.unpack_from('<f', buf, o)[0]
+    def u64(o): return struct.unpack_from('<Q', buf, o)[0]
+
+    offs = 0x40
+    offs += 8
+    frame_count_var = u32(offs); offs += 8
+    offs += 4 * frame_count_var + 8
+
+    first_size  = u32(offs); offs += 4
+    second_size = u32(offs); offs += 4
+    offs += 4 * first_size * second_size * 12
+    offs += 8   # fps_0 + pad
+
+    mrtr_bone_count   = u32(offs); offs += 4
+    used_bone_count_0 = u32(offs); offs += 4
+    mrtr_bone_offset  = u64(offs); offs += 8
+    used_bone_offset  = u64(offs); offs += 8
+
+    offs += 2 * mrtr_bone_count   # skip mrtr_bone_indices
+    offs += int(used_bone_offset - mrtr_bone_offset - mrtr_bone_count * 2)
+    used_bone_indices = list(struct.unpack_from('<' + 'h' * used_bone_count_0, buf, offs))
+    offs += 2 * used_bone_count_0
+
+    align_rem = int((used_bone_offset + used_bone_count_0 * 2) % 0x80)
+    offs += (0x80 - align_rem) if align_rem else 0
+    offs += 0x50
+
+    duration        = f32(offs); offs += 4
+    used_bone_count = u16(offs); offs += 2
+    offs += 0xA
+
+    frame_count_1 = u32(offs); offs += 4
+    fps           = f32(offs); offs += 4
+
+    anim_data_size_offset = offs
+    anim_data_size        = u32(offs); offs += 8
+
+    offs += 4   # frame_count_2
+    static_quat_bone_count  = u16(offs); offs += 2
+    static_trans_bone_count = u16(offs); offs += 2
+    scale = [f32(offs), f32(offs + 4), f32(offs + 8)]; offs += 12
+    has_bind_poses = u8(offs); offs += 1
+    offs += 3
+
+    bind_count = used_bone_count * 2 if has_bind_poses else 0
+    s = ((used_bone_count + 0x3f) >> 6) * 8
+    quat_bit_offs   = offs; offs += s
+    trans_bit_offs  = offs; offs += s
+    retgt_bit_offs  = offs
+    s = ((bind_count + 0x3f) >> 6) * 8; offs += s
+
+    static_q_offs  = offs; offs += static_quat_bone_count * 8
+    dynamic_q_offs = offs; offs += (used_bone_count - static_quat_bone_count) * frame_count_1 * 8
+    bind_q_offs    = offs; offs += bind_count * 8
+    static_t_offs  = offs; offs += static_trans_bone_count * 8
+    dynamic_t_offs = offs; offs += (used_bone_count - static_trans_bone_count) * frame_count_1 * 8
+    bind_t_offs    = offs
+
+    jcount_helper = (used_bone_count + 0x3f) >> 6
+    tracks = {}
+
+    # Root motion (bone index -1)
+    roffs = anim_data_size_offset + anim_data_size
+    if anim_data_size > 0:
+        rots, poss = [], []
+        for _ in range(frame_count_1):
+            q_raw = list(struct.unpack_from('<4f', buf, roffs)); roffs += 16
+            p_raw = list(struct.unpack_from('<4f', buf, roffs)); roffs += 16
+            q_raw.reverse()   # match per-bone convention; assumed WXYZ after reverse
+            rots.append(q_raw)
+            poss.append(p_raw[:3])
+        tracks[-1] = {"rot": rots, "pos": poss}
+
+    # Per-bone animation
+    bone_i       = 0
+    static_qi    = 0
+    static_ti    = 0
+    stop         = False
+
+    for u in range(jcount_helper):
+        if stop:
+            break
+        qbf = struct.unpack_from('<Q', buf, quat_bit_offs  + u * 8)[0]
+        tbf = struct.unpack_from('<Q', buf, trans_bit_offs + u * 8)[0]
+        rbf = struct.unpack_from('<Q', buf, retgt_bit_offs + u * 8)[0]
+
+        for _ in range(0x40):
+            if bone_i >= used_bone_count:
+                stop = True; break
+
+            jidx     = used_bone_indices[bone_i]
+            bqa_offs = (bone_i * 2) * 8
+            bqb_offs = (bone_i * 2 + 1) * 8
+            bta_offs = bone_i * 8
+
+            b_rots, b_poss = [], []
+
+            for f in range(frame_count_1):
+                # Quaternion
+                if qbf & 1:
+                    qo = static_q_offs + static_qi * 8
+                else:
+                    qo = dynamic_q_offs + (((used_bone_count - static_quat_bone_count) * f - static_qi) + bone_i) * 8
+                quat, _ = _mjba_decomp_quat(buf, qo)
+
+                # Position
+                if tbf & 1:
+                    po = static_t_offs + static_ti * 8
+                else:
+                    po = dynamic_t_offs + (((used_bone_count - static_trans_bone_count) * f - static_ti) + bone_i) * 8
+                pos, _ = _mjba_decomp_pos(buf, po, scale)
+
+                # Bind pose retargeting
+                if has_bind_poses and (rbf & 1):
+                    quatA, _ = _mjba_decomp_quat(buf, bind_q_offs + bqa_offs)
+                    quatB, _ = _mjba_decomp_quat(buf, bind_q_offs + bqb_offs)
+                    posA, _  = _mjba_decomp_pos(buf,  bind_t_offs + bta_offs, scale)
+                    _mjba_decomp_all(quat, pos, quatA, quatB, posA)
+
+                # Simulate C++ std::reverse on both; quat is now WXYZ for Blender
+                quat.reverse()
+                # pos was [1.0, Z, Y, X] → reversed [X, Y, Z, 1.0] → take first 3
+                pos_xyz = [pos[3], pos[2], pos[1]]
+
+                b_rots.append(list(quat))
+                b_poss.append(pos_xyz)
+
+            if jidx >= 0:
+                tracks[jidx] = {"rot": b_rots, "pos": b_poss}
+
+            if qbf & 1: static_qi += 1
+            if tbf & 1: static_ti += 1
+            qbf >>= 1; tbf >>= 1; rbf >>= 1
+            bone_i += 1
+
+    return {
+        "fps":             fps,
+        "frame_count":     frame_count_1,
+        "mrtr_bone_count": mrtr_bone_count,
+        "tracks":          tracks,
+    }
+
+
+class IMPORT_SCENE_OT_glacier2_mjba(bpy.types.Operator, ImportHelper):
+    bl_idname   = "import_scene.glacier2_mjba"
+    bl_label    = "Import 007 Animation (.MJBA)"
+    bl_description = ("Load a native Glacier 2 .MJBA animation file onto the "
+                      "active armature. Requires the skeleton to have been imported "
+                      "via Import 007 Skeleton (.borg).")
+    bl_options  = {"REGISTER", "UNDO"}
+    filename_ext = ".MJBA"
+    filter_glob: StringProperty(default="*.MJBA;*.mjba", options={"HIDDEN"})
+
+    def execute(self, context):
+        import os as _os
+
+        arm = _rig_active_armature(context)
+        if arm is None:
+            self.report({"WARNING"}, "Select the target armature first")
+            return {"CANCELLED"}
+
+        # Bone index → Blender bone name map (stored by BORG importer)
+        bone_names = list(arm.get("glacier_borg_bone_names", []))
+        if not bone_names:
+            # Fallback: use bones in their current order
+            bone_names = [b.name for b in arm.data.bones]
+            self.report({"WARNING"},
+                        "Armature has no bone index map — was it imported with "
+                        "'Import 007 Skeleton'?  Falling back to bone order.")
+
+        try:
+            data = _mjba_parse(self.filepath)
+        except Exception as e:
+            self.report({"ERROR"}, "Failed to parse MJBA: %s" % e)
+            return {"CANCELLED"}
+
+        fps          = data["fps"] or 30.0
+        frame_count  = data["frame_count"]
+        bone_count   = data["mrtr_bone_count"]
+        tracks       = data["tracks"]
+
+        if bone_count != len(bone_names):
+            self.report({"WARNING"},
+                        "MJBA bone count (%d) doesn't match armature bone count (%d). "
+                        "Animation may be misaligned." % (bone_count, len(bone_names)))
+
+        anim = GlacierAnim(fps=fps, frame_start=0)
+        for bone_idx, td in tracks.items():
+            if bone_idx == -1:
+                # Root motion — map to first bone (index 0) if available
+                bname = bone_names[0] if bone_names else None
+            elif 0 <= bone_idx < len(bone_names):
+                bname = bone_names[bone_idx]
+            else:
+                continue
+            if bname is None:
+                continue
+
+            keys = []
+            rots = td["rot"]
+            poss = td["pos"]
+            for f in range(frame_count):
+                frame = f
+                rot   = tuple(rots[f]) if f < len(rots) else None
+                loc   = tuple(poss[f]) if f < len(poss) else None
+                keys.append((frame, loc, rot, None))   # no scale data in MJBA
+            if keys:
+                anim.tracks[bname] = keys
+
+        if not anim.tracks:
+            self.report({"ERROR"}, "No usable bone tracks found in MJBA")
+            return {"CANCELLED"}
+
+        try:
+            matched, inserted = _anim_apply(arm, anim,
+                                            action_name=_os.path.splitext(
+                                                _os.path.basename(self.filepath))[0])
+        except GlacierAnimError as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+
+        self.report({"INFO"},
+                    "MJBA '%s': %d/%d bone tracks applied, %d keys @ %gfps"
+                    % (_os.path.basename(self.filepath),
+                       matched, len(anim.tracks), inserted, fps))
+        return {"FINISHED"}
+
+
+def _mjba_menu_import(self, context):
+    self.layout.operator(IMPORT_SCENE_OT_glacier2_mjba.bl_idname,
+                         text="007 Animation (.MJBA)")
+
+
 def _glacier_remember_export_dir(context, base_dir):
     """After an export, remember the folder so the RPKG packer can auto-fill."""
     try:
@@ -14846,6 +15218,7 @@ _panel_classes = (
     GLACIER_OT_anim_clear,
     IMPORT_SCENE_OT_glacier2_anmc,
     GLACIER_OT_anmc_clear_info,
+    IMPORT_SCENE_OT_glacier2_mjba,
     GLACIER_OT_use_export_folder,
     GLACIER_OT_pack_rpkg,
     GLACIER_OT_toggle_cloth_planes,
@@ -15217,12 +15590,14 @@ def register():
     bpy.types.Scene.glacier_show_anim = bpy.props.BoolProperty(default=False)
 
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
+    bpy.types.TOPBAR_MT_file_import.append(_mjba_menu_import)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
 
 
 def unregister():
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
+    bpy.types.TOPBAR_MT_file_import.remove(_mjba_menu_import)
     for _p in ("glacier_show_anim", "glacier_rig_clean_dryrun", "glacier_rig_twist",
                "glacier_rig_foot_roll", "glacier_rig_ik_legs", "glacier_rig_ik_arms",
                "glacier_rig_target", "glacier_show_rig"):
