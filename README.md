@@ -20,7 +20,7 @@ A complete modding toolkit for **007 First Light** (Glacier 2 / KNT engine) buil
 
 ## Install
 
-1. Download `io_scene_glacier2_007.py` from [Releases](https://github.com/glacier-modding/io_scene_glacier2_007/releases)
+1. Download `io_scene_glacier2_007.zip` from [Releases](https://github.com/glacier-modding/io_scene_glacier2_007/releases)
 2. **Edit → Preferences → Add-ons → Install from Disk**
 3. Enable and **restart Blender**
 4. Press **N**, click **007 Mesh Tools**
