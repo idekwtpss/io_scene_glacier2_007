@@ -31,7 +31,7 @@ A complete modding toolkit for **007 First Light** (Glacier 2 / KNT engine) buil
 
 Import `.prim` models and `.borg` skeletons. Load their materials. Build real Blender shaders in one click. Decode and edit textures natively (BC1–BC7, no external tools). Reshape meshes safely. Export everything back to the game with correct hashes and metadata.
 
-**Full documentation, step-by-step walkthroughs, and troubleshooting:** https://007toolsguide.netlify.app/
+**Full documentation, step-by-step walkthroughs, and troubleshooting:** https://idekwtpss.github.io/007ToolKitGuide.github.io/
 
 ---
 
