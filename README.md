@@ -2,7 +2,7 @@
 
 A complete modding toolkit for **007 First Light** (Glacier 2 / KNT engine) built into Blender. Import game models, rebuild their materials, swap textures, reshape meshes, and export everything back as game-ready files.
 
-**Latest:** v1.14 | **Blender:** 4.2+ | **Status:** Stable
+**Latest:** v2.9.1 | **Blender:** 4.2+ | **Status:** Stable
 
 ---
 
