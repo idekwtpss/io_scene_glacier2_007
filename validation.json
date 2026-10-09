@@ -1,0 +1,42 @@
+[
+  {
+    "module": "glacier2_007_toolkit",
+    "input": "C:\\Users\\Garrett Esparza\\Documents\\Codex\\2026-06-19\\he\\work\\007fl_mod_patcher\\evidence\\01C75259EEAD9C5B.old.PRIM",
+    "sha256": "98068e8fa675a222bb46956f6a585f3fdabbb560f618e9e485022c90df365432",
+    "objects": 20,
+    "safe_export_reimport": true,
+    "custom_export_reimport": true,
+    "vertices_indices_weights_preserved": true,
+    "edited_custom_export_reimport": true
+  },
+  {
+    "module": "glacier2_007_toolkit",
+    "input": "C:\\Users\\Garrett Esparza\\Documents\\Codex\\2026-06-19\\he\\work\\007-EntityViewer\\evidence\\01C75259EEAD9C5B.updated.PRIM",
+    "sha256": "fbcd16ed53152c98ca7d464ac35f0c4955b9aa568564a8d9ce9c819d365794bc",
+    "objects": 20,
+    "safe_export_reimport": true,
+    "custom_export_reimport": true,
+    "vertices_indices_weights_preserved": true,
+    "edited_custom_export_reimport": true
+  },
+  {
+    "module": "glacier2_007_toolkit.prim",
+    "input": "C:\\Users\\Garrett Esparza\\Documents\\Codex\\2026-06-19\\he\\work\\007fl_mod_patcher\\evidence\\01C75259EEAD9C5B.old.PRIM",
+    "sha256": "98068e8fa675a222bb46956f6a585f3fdabbb560f618e9e485022c90df365432",
+    "objects": 20,
+    "safe_export_reimport": true,
+    "custom_export_reimport": true,
+    "vertices_indices_weights_preserved": true,
+    "edited_custom_export_reimport": true
+  },
+  {
+    "module": "glacier2_007_toolkit.prim",
+    "input": "C:\\Users\\Garrett Esparza\\Documents\\Codex\\2026-06-19\\he\\work\\007-EntityViewer\\evidence\\01C75259EEAD9C5B.updated.PRIM",
+    "sha256": "fbcd16ed53152c98ca7d464ac35f0c4955b9aa568564a8d9ce9c819d365794bc",
+    "objects": 20,
+    "safe_export_reimport": true,
+    "custom_export_reimport": true,
+    "vertices_indices_weights_preserved": true,
+    "edited_custom_export_reimport": true
+  }
+]
