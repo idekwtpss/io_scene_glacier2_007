@@ -2,7 +2,7 @@
 
 A complete modding toolkit for **007 First Light** (Glacier 2 / KNT engine) built into Blender. Import game models, rebuild their materials, swap textures, reshape meshes, and export everything back as game-ready files.
 
-**Latest:** v2.9.1 | **Blender:** 4.2+ | **Status:** Stable
+**Latest:** v2.9.2 | **Blender:** 4.2+ | **PRIM update tested:** Blender 5.0
 
 ---
 
@@ -20,7 +20,7 @@ A complete modding toolkit for **007 First Light** (Glacier 2 / KNT engine) buil
 
 ## Install
 
-1. Download `io_scene_glacier2_007.zip` from [Releases](https://github.com/glacier-modding/io_scene_glacier2_007/releases)
+1. Download `glacier2_007_toolkit_v2.9.2_prim_sentinel.zip` from [Releases](https://github.com/idekwtpss/io_scene_glacier2_007/releases/tag/v2.9.2)
 2. **Edit → Preferences → Add-ons → Install from Disk**
 3. Enable and **restart Blender**
 4. Press **N**, click **007 Mesh Tools**
@@ -28,6 +28,19 @@ A complete modding toolkit for **007 First Light** (Glacier 2 / KNT engine) buil
 ---
 
 ## How It Works
+
+### Path-Tracing PRIM Update (v2.9.2)
+
+Imports both legacy PRIM files and updated files with the `FF FF FF FF`
+pre-scale sentinel. Safe-edit and custom-mesh export preserve the source
+template's format. Use a freshly extracted updated-game PRIM as your template
+when exporting for the current game; this addon does not convert old templates.
+
+Import/export round trips were tested in Blender 5.0 against matching old and
+updated stock head files. In-game rendering and interactive UI operators were
+not tested. Materials, cloth simulation and RPKG logic are unchanged.
+See [validation details](PRIM_SENTINEL_UPDATE.md). The root
+`glacier2_007_toolkit_clean_v2.zip` also contains this v2.9.2 build.
 
 Import `.prim` models and `.borg` skeletons. Load their materials. Build real Blender shaders in one click. Decode and edit textures natively (BC1–BC7, no external tools). Reshape meshes safely. Export everything back to the game with correct hashes and metadata.
 
